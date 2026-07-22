@@ -1,0 +1,10 @@
+google-genai
+edge-tts
+moviepy
+Pillow
+numpy
+pydantic
+requests
+gspread
+oauth2client
+python-dotenv

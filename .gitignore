@@ -1,0 +1,20 @@
+# Sekrety i dane uwierzytelniające
+.env
+.env.*
+!.env.example
+service_account*.json
+secrets/
+
+# Środowisko i pliki tymczasowe Pythona
+.venv/
+__pycache__/
+*.py[cod]
+
+# Wygenerowane materiały
+output/
+
+# Prywatne nagrania głosu (zostawiamy tylko instrukcję i tekst próbki)
+glos_z_filmu.mp3
+voice_samples/*
+!voice_samples/README.md
+!voice_samples/tekst_probki_pl.txt
