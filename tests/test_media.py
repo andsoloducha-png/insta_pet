@@ -5,11 +5,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from media import (
     OUTPUT_DIR,
     TimedWord,
+    _cover_title_lines,
+    _font,
     build_caption_cues,
     extract_drive_id,
     generate_audio_with_timings,
@@ -26,6 +28,16 @@ except ImportError:
 
 
 class MediaTests(unittest.TestCase):
+    def test_cover_title_breaks_before_short_polish_preposition(self):
+        draw = ImageDraw.Draw(Image.new("RGB", (1080, 1920), "white"))
+        lines = _cover_title_lines(
+            draw,
+            "PIERWSZA WIZYTA U BABCI",
+            _font(78),
+            max_width=840,
+        )
+        self.assertEqual(lines, [["PIERWSZA", "WIZYTA"], ["U", "BABCI"]])
+
     def test_parses_multiple_plain_and_markdown_links(self):
         value = """
         [zdjęcie](https://drive.google.com/file/d/1234567890123456789012345/view)

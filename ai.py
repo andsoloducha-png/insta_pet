@@ -19,6 +19,7 @@ from config import (
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_MAX_RETRIES,
     GEMINI_MODEL,
+    GEMINI_PROOFREADER_ENABLED,
     GEMINI_THINKING_LEVEL,
 )
 
@@ -45,6 +46,10 @@ WRONG_BREED_REPLACEMENTS = (
     (re.compile(r"\bpudel(?:ek|ka)?\s*toy\b", flags=re.IGNORECASE), "pudel miniaturowy"),
     (re.compile(r"\btoy\s+poodle\b", flags=re.IGNORECASE), "pudel miniaturowy"),
 )
+BREED_MENTION_PATTERN = re.compile(
+    r"\bpud(?:el|la|lem|lowi|lu)\s+miniaturow\w*",
+    flags=re.IGNORECASE,
+)
 
 
 class ReelContent(BaseModel):
@@ -52,7 +57,7 @@ class ReelContent(BaseModel):
 
     voiceover: str = Field(description="Naturalny tekst lektora w pierwszej osobie psa.")
     headline: str = Field(description="Hook na pierwsze 1-2 sekundy, 3-7 słów.")
-    cover_title: str = Field(description="Tytuł osobnej okładki, maksymalnie 5 słów.")
+    cover_title: str = Field(description="Tytuł osobnej okładki, maksymalnie 4 słowa.")
     caption_body: str = Field(description="Opis posta w pierwszej osobie psa, bez hashtagów.")
     hashtags: list[str] = Field(description="Od 3 do 5 niepersonalnych hashtagów tematycznych.")
     alt_text: str = Field(description="Krótki, rzeczowy tekst alternatywny mediów.")
@@ -80,6 +85,13 @@ def _correct_breed(text: str) -> str:
     for pattern, replacement in WRONG_BREED_REPLACEMENTS:
         corrected = pattern.sub(replacement, corrected)
     return corrected
+
+
+def _clean_cover_title(text: str) -> str:
+    words = text.strip().split()
+    if len(words) > 4 and words[0].casefold() in {"mój", "moja", "moje", "nasz", "nasza"}:
+        words = words[1:]
+    return " ".join(words[:4]).upper()
 
 
 def _normalise_hashtags(values: list[str]) -> list[str]:
@@ -126,7 +138,7 @@ def _normalise_content(content: ReelContent, media_count: int) -> dict:
     return {
         "lektor": voiceover,
         "naglowek": content.headline.strip().upper(),
-        "cover_title": content.cover_title.strip().upper(),
+        "cover_title": _clean_cover_title(content.cover_title),
         "caption_body": caption_body,
         "hashtags": hashtags,
         "caption": caption,
@@ -144,7 +156,11 @@ def _has_first_person(text: str) -> bool:
     return bool(markers.search(text))
 
 
-def _content_quality_issues(content: ReelContent) -> list[str]:
+def _content_quality_issues(
+    content: ReelContent,
+    *,
+    allow_breed_in_narrative: bool = True,
+) -> list[str]:
     issues: list[str] = []
     narrative = f"{content.voiceover}\n{content.caption_body}"
     third_person_name = re.compile(
@@ -159,6 +175,11 @@ def _content_quality_issues(content: ReelContent) -> list[str]:
         issues.append("caption_body nie zawiera wyraźnej pierwszej osoby")
     if re.search(r"\btoy\b|#?pudeltoy\b", narrative + " " + " ".join(content.hashtags), re.I):
         issues.append("w treści występuje błędne określenie toy")
+    breed_mentions = len(BREED_MENTION_PATTERN.findall(narrative))
+    if not allow_breed_in_narrative and breed_mentions:
+        issues.append("rasa nie jest związana z tematem, ale pojawia się w narracji")
+    elif breed_mentions > 1:
+        issues.append(f"rasa jest powtórzona {breed_mentions} razy zamiast maksymalnie raz")
 
     voiceover_words = len(re.findall(r"\b\w+[’'-]?\w*\b", content.voiceover, flags=re.UNICODE))
     if not 24 <= voiceover_words <= 45:
@@ -167,6 +188,17 @@ def _content_quality_issues(content: ReelContent) -> list[str]:
     if not 250 <= caption_length <= 600:
         issues.append(f"caption_body ma {caption_length} znaków zamiast 250-600")
     return issues
+
+
+def _breed_is_relevant(nazwa: str, opis: str) -> bool:
+    source = f"{nazwa} {opis}".casefold()
+    return bool(
+        re.search(
+            r"pudel|rasa|miniaturow|sier[śs][ćc]|fryz|strzy|trym|czes|"
+            r"groom|wielko[śs][ćc]|rozmiar",
+            source,
+        )
+    )
 
 
 def _finish_reason(response: object) -> str:
@@ -263,6 +295,7 @@ def _editor_prompt(
     nazwa: str,
     opis: str,
     media_count: int,
+    allow_breed_in_narrative: bool,
     quality_feedback: list[str] | None = None,
 ) -> str:
     feedback = "\n".join(f"- {issue}" for issue in (quality_feedback or []))
@@ -270,6 +303,14 @@ def _editor_prompt(
         f"\nBŁĘDY WYKRYTE AUTOMATYCZNIE — wszystkie muszą zostać poprawione:\n{feedback}\n"
         if feedback
         else ""
+    )
+    breed_instruction = (
+        f"Możesz użyć określenia „{DOG_BREED}” najwyżej raz łącznie w voiceover i caption_body."
+        if allow_breed_in_narrative
+        else (
+            f"Temat nie dotyczy rasy. Nie używaj określenia „{DOG_BREED}” ani słowa "
+            "„pudel” w voiceover lub caption_body; rasa pozostaje tylko w alt_text i hashtagu."
+        )
     )
     return f"""
 Jesteś bezkompromisowym polskim redaktorem treści na Instagram. Popraw poniższy
@@ -294,7 +335,7 @@ Lista kontrolna przed odpowiedzią:
    od „{DOG_NAME}...”, „Pudel {DOG_NAME}...” ani opisu bohatera w trzeciej osobie.
    Poprawnie: „Pierwszy raz odwiedziłem babcię...”.
    Błędnie: „Pudel {DOG_NAME} pierwszy raz odwiedza babcię...”.
-2. Używaj określenia „{DOG_BREED}”. Usuń każde „toy”.
+2. „{DOG_BREED}” to fakt profilu, nie slogan. Usuń każde „toy”. {breed_instruction}
 3. Zachowaj naturalną, potoczną polszczyznę, jedną mini-historię i maksymalnie 3 emoji.
 4. Zweryfikuj szkic względem opisu i dołączonych mediów. Usuń każdy fakt, emocję,
    intencję i rezultat, którego nie potwierdza opis albo obraz. Nie zakładaj, że psy
@@ -305,9 +346,66 @@ Lista kontrolna przed odpowiedzią:
 6. Podaj 3-5 hashtagów bez imienia {DOG_NAME} i bez tagów brandingowych. Zastosuj miks:
    rasa, szersza kategoria psów i 1-3 tagi ściśle związane z tą historią. Zakazane:
    #pudeltoy, #fyp, #viral, #reels, #instagood.
-7. headline i cover_title mają być konkretne, krótkie i zgodne z wydarzeniem.
+7. headline i cover_title mają być konkretne i zgodne z wydarzeniem. cover_title ma
+   maksymalnie 4 słowa; usuń zbędne „mój/moja”, jeśli bez niego sens się nie zmienia.
+8. Zrób korektę polszczyzny: składnia, odmiana, związki frazeologiczne, interpunkcja
+   i powtórzenia. Nie zostawiaj urwanych konstrukcji typu „postanowiłem nie dłużny”.
 
 Zwróć wyłącznie kompletny obiekt zgodny ze schematem.
+"""
+
+
+def _proofreader_prompt(
+    content: ReelContent,
+    nazwa: str,
+    opis: str,
+    media_count: int,
+    allow_breed_in_narrative: bool,
+    quality_feedback: list[str] | None = None,
+) -> str:
+    evidence_rule = (
+        "Dołączono media: wolno zachować dodatkowy szczegół tylko wtedy, gdy jest na nich jednoznacznie widoczny."
+        if media_count
+        else "Nie dołączono mediów: każdy konkretny szczegół musi wynikać dosłownie ze ŹRÓDŁA."
+    )
+    breed_rule = (
+        f"Rasa „{DOG_BREED}” może wystąpić najwyżej raz w voiceover + caption_body."
+        if allow_breed_in_narrative
+        else f"Usuń rasę „{DOG_BREED}” i słowo „pudel” z voiceover oraz caption_body."
+    )
+    feedback = "\n".join(f"- {issue}" for issue in (quality_feedback or []))
+    feedback_section = (
+        f"\nBŁĘDY Z POPRZEDNIEJ KOREKTY — popraw wszystkie:\n{feedback}\n"
+        if feedback
+        else ""
+    )
+    return f"""
+Jesteś polskim korektorem końcowym. Popraw wyłącznie błędy językowe i niezręczne
+sformułowania w poniższym JSON-ie. Nie dodawaj faktów, emocji, skutków ani nowych
+żartów. Zachowaj pierwszą osobę psa, strukturę JSON, asset_order i sens wypowiedzi.
+
+Profil: {DOG_NAME}, {DOG_BREED}.
+Źródło: {nazwa or 'brak'} — {opis or 'brak'}.
+Zasada dowodowa: {evidence_rule}
+Zasada rasy: {breed_rule}
+
+Sprawdź szczególnie:
+- poprawną odmianę i pełne konstrukcje zdaniowe;
+- zgodność podmiotu i orzeczenia;
+- naturalne związki frazeologiczne;
+- brak powtórzeń imienia i rasy (rasa najwyżej raz w voiceover + caption_body);
+- zachowanie długości: voiceover 24-45 słów, caption_body 250-600 znaków;
+- literalne oparcie każdego twierdzenia na źródle lub obrazie. Usuń niewskazane
+  działania i cechy, np. warczenie, szczekanie, reakcję „od progu”, „ulubiony” dywan,
+  aferę, rewanż, stres albo zgodę, jeśli dokładnie tego nie potwierdza źródło;
+- jedno konkretne pytanie na końcu caption_body;
+- maksymalnie 4 słowa w cover_title.
+
+TREŚĆ DO KOREKTY:
+{content.model_dump_json(ensure_ascii=False)}
+{feedback_section}
+
+Zwróć wyłącznie kompletny, poprawiony obiekt zgodny ze schematem.
 """
 
 
@@ -322,6 +420,15 @@ def generate_reel_content(
 
     paths = [Path(path) for path in (media_paths or [])][:MAX_MEDIA_FOR_AI]
     media_count = len(paths)
+    allow_breed_in_narrative = _breed_is_relevant(nazwa, opis)
+    breed_narration_instruction = (
+        f"Możesz naturalnie użyć określenia „{DOG_BREED}” najwyżej raz łącznie w voiceover i caption_body."
+        if allow_breed_in_narrative
+        else (
+            f"Temat nie dotyczy rasy: nie używaj „{DOG_BREED}” ani słowa „pudel” "
+            "w voiceover i caption_body. Rasa pojawi się w alt_text i hashtagu."
+        )
+    )
     prompt = f"""
 Jesteś polskim strategiem Instagram Reels i scenarzystą konta psa.
 
@@ -346,10 +453,11 @@ Przygotuj jedną spójną rolkę:
    mówi {DOG_NAME} jako „ja”. Nie zaczynaj od „{DOG_NAME}...” ani „Pudel {DOG_NAME}...”.
    Jedna mini-historia: hook, rozwinięcie, puenta. Bez żebrania o lajki.
 2. headline: 3-7 słów, konkretny hook bez clickbaitu.
-3. cover_title: maksymalnie 5 słów, czytelny poza kontekstem rolki.
-4. caption_body: 250-600 znaków, również w pierwszej osobie psa. Naturalne frazy
-   „{DOG_BREED}”, „pies” i temat historii umieść w pierwszych dwóch zdaniach, bez
-   sztucznego upychania. Maksymalnie 3 emoji. Na końcu jedno łatwe pytanie.
+3. cover_title: maksymalnie 4 słowa, czytelny poza kontekstem rolki. Bez zbędnego
+   „mój/moja”, jeśli tytuł jest równie jasny bez tego słowa.
+4. caption_body: 250-600 znaków, również w pierwszej osobie psa. Użyj naturalnie
+   słowa „pies” i tematu historii w pierwszych dwóch zdaniach. {breed_narration_instruction}
+   Maksymalnie 3 emoji. Na końcu jedno łatwe pytanie.
 5. hashtags: 3-5 niepersonalnych tagów. Bez imienia {DOG_NAME}. Miks: rasa, szersza
    kategoria psów i 1-3 tagi tematyczne. Bez #pudeltoy, #fyp, #viral i #reels.
 6. alt_text: rzeczowy opis wyłącznie tego, co faktycznie widać.
@@ -372,7 +480,10 @@ Przygotuj jedną spójną rolkę:
     final_content = draft
     if GEMINI_EDITOR_ENABLED:
         editorial_draft = draft
-        quality_feedback = _content_quality_issues(editorial_draft)
+        quality_feedback = _content_quality_issues(
+            editorial_draft,
+            allow_breed_in_narrative=allow_breed_in_narrative,
+        )
         for editorial_round in range(1, 3):
             try:
                 final_content = _request_content(
@@ -384,11 +495,12 @@ Przygotuj jedną spójną rolkę:
                             nazwa,
                             opis,
                             media_count,
+                            allow_breed_in_narrative,
                             quality_feedback,
                         ),
                         *media_parts,
                     ],
-                    temperature=0.25,
+                    temperature=0.15,
                     stage=f"redakcja {editorial_round}/2",
                     thinking_level=types.ThinkingLevel.LOW,
                 )
@@ -396,7 +508,10 @@ Przygotuj jedną spójną rolkę:
                 LOGGER.warning("Redakcja Gemini %s/2 nie powiodła się: %s", editorial_round, exc)
                 continue
 
-            quality_feedback = _content_quality_issues(final_content)
+            quality_feedback = _content_quality_issues(
+                final_content,
+                allow_breed_in_narrative=allow_breed_in_narrative,
+            )
             if not quality_feedback:
                 break
             LOGGER.warning(
@@ -406,7 +521,51 @@ Przygotuj jedną spójną rolkę:
             )
             editorial_draft = final_content
 
-        remaining_issues = _content_quality_issues(final_content)
+    if GEMINI_PROOFREADER_ENABLED:
+        proofread_draft = final_content
+        proofread_feedback: list[str] = []
+        for proofread_round in range(1, 3):
+            try:
+                final_content = _request_content(
+                    client,
+                    models,
+                    [
+                        _proofreader_prompt(
+                            proofread_draft,
+                            nazwa,
+                            opis,
+                            media_count,
+                            allow_breed_in_narrative,
+                            proofread_feedback,
+                        ),
+                        *media_parts,
+                    ],
+                    temperature=0.1,
+                    stage=f"korekta językowa {proofread_round}/2",
+                    thinking_level=types.ThinkingLevel.MEDIUM,
+                )
+            except Exception as exc:
+                LOGGER.warning("Końcowa korekta językowa %s/2 nie powiodła się: %s", proofread_round, exc)
+                continue
+
+            proofread_feedback = _content_quality_issues(
+                final_content,
+                allow_breed_in_narrative=allow_breed_in_narrative,
+            )
+            if not proofread_feedback:
+                break
+            LOGGER.warning(
+                "Kontrola jakości po korekcie %s/2: %s",
+                proofread_round,
+                "; ".join(proofread_feedback),
+            )
+            proofread_draft = final_content
+
+    if GEMINI_EDITOR_ENABLED or GEMINI_PROOFREADER_ENABLED:
+        remaining_issues = _content_quality_issues(
+            final_content,
+            allow_breed_in_narrative=allow_breed_in_narrative,
+        )
         if remaining_issues:
             raise RuntimeError(
                 "Treść nie przeszła kontroli jakości: " + "; ".join(remaining_issues)

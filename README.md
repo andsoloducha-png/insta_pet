@@ -36,11 +36,17 @@ Domyślna konfiguracja Gemini ogranicza poziom rozumowania do `minimal`, przezna
 3 razy. Modelem awaryjnym jest `gemini-3.5-flash-lite`; wszystkie te wartości
 można zmienić w `.env` na podstawie `.env.example`.
 
-Profil bohatera jest stały (`DOG_NAME=Jogi`, `DOG_BREED=pudel miniaturowy`). Przy
-`GEMINI_EDITOR_ENABLED=true` drugie wywołanie Gemini redaguje szkic, sprawdza
-pierwszą osobę, fakty, rasę i długość. Zwiększa to zużycie Gemini, ale ogranicza
-niespójne lub dopowiedziane opisy. Automatyczna bramka jakości nie zapisze tekstu,
-który nadal miesza perspektywę albo zawiera określenie `toy`.
+Profil bohatera jest konfigurowany przez `DOG_NAME=Jogi` i
+`DOG_BREED=pudel miniaturowy`. Przy `GEMINI_EDITOR_ENABLED=true` drugie wywołanie
+Gemini redaguje szkic, a `GEMINI_PROOFREADER_ENABLED=true` uruchamia końcową korektę
+językową. To do trzech wywołań Gemini na wpis: zwiększa koszt i czas, ale ogranicza
+niespójne, dopowiedziane i niepoprawne językowo opisy. Automatyczna bramka jakości
+nie zapisze tekstu, który miesza perspektywę albo zawiera określenie `toy`.
+
+Rasa trafia zawsze do hashtagu i może trafić do alt textu. W narracji pojawia się
+tylko wtedy, gdy sam temat dotyczy rasy, wielkości, sierści lub pielęgnacji. Przy
+integracji z wieloma profilami Dziennik psa powinien przekazywać imię i rasę z
+rekordu zwierzęcia; wartości z `.env` pozostaną ustawieniami domyślnymi.
 
 Opis zawiera maksymalnie 5 niepersonalnych hashtagów: rasowy, szeroki `#pies` oraz
 tagi związane z konkretną historią. Tagi z imieniem psa i ogólne tagi spamowe

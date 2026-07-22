@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 from config import (
     BASE_DIR,
+    DOG_NAME,
     TTS_FALLBACK_VOICES,
     TTS_MAX_RETRIES,
     TTS_PITCH,
@@ -309,6 +310,23 @@ def _wrap_words(draw: ImageDraw.ImageDraw, words: list[str], font, max_width: in
     return lines
 
 
+def _cover_title_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: int,
+) -> list[list[str]]:
+    words = text.split()
+    # Krótkie polskie przyimki naturalnie rozpoczynają drugą linię, np. „U BABCI”.
+    for index in range(1, len(words)):
+        if words[index].casefold() not in {"u", "w", "na", "do", "z", "bez", "o"}:
+            continue
+        lines = [words[:index], words[index:]]
+        if all(draw.textlength(" ".join(line), font=font) <= max_width for line in lines):
+            return lines
+    return _wrap_words(draw, words, font, max_width)
+
+
 def _ken_burns(image: Image.Image, progress: float, segment_index: int, animated: bool) -> Image.Image:
     progress = min(1.0, max(0.0, progress))
     smooth = progress * progress * (3 - 2 * progress)
@@ -586,32 +604,46 @@ def render_reel_video(
 def _draw_cover_text(image: Image.Image, text: str) -> None:
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    gradient_top = 380
-    for y in range(gradient_top, 1380):
-        alpha = int(150 * abs(y - 880) / 500)
-        alpha = min(150, max(30, 150 - alpha))
+    # Lekki cień tylko w górnej strefie poprawia czytelność bez zasłaniania psa.
+    gradient_top = 210
+    gradient_bottom = 690
+    for y in range(gradient_top, gradient_bottom):
+        progress = (y - gradient_top) / (gradient_bottom - gradient_top)
+        alpha = round(105 * (1.0 - progress))
         draw.line((0, y, VIDEO_WIDTH, y), fill=(0, 0, 0, alpha))
 
-    brand_font = _font(34)
-    brand = "JOGI • DZIENNIK PSA"
-    brand_width = draw.textlength(brand, font=brand_font)
-    draw.text(((VIDEO_WIDTH - brand_width) / 2, 500), brand, font=brand_font, fill=(205, 220, 255, 255))
+    brand_font = _font(30)
+    brand = f"{DOG_NAME.upper()} • DZIENNIK PSA"
+    brand_y = 270
+    draw.rounded_rectangle((76, brand_y - 4, 88, brand_y + 39), radius=6, fill=(46, 111, 255, 255))
+    draw.text((108, brand_y), brand, font=brand_font, fill=(215, 227, 255, 255))
 
-    title_font = _font(94)
-    lines = _wrap_words(draw, text.split(), title_font, 900)[:3]
-    start_y = 600
+    title_font_size = 78
+    while title_font_size >= 56:
+        title_font = _font(title_font_size)
+        lines = _cover_title_lines(draw, text, title_font, max_width=840)
+        if len(lines) <= 2:
+            break
+        title_font_size -= 2
+    else:
+        title_font_size = 56
+        title_font = _font(title_font_size)
+        lines = _wrap_words(draw, text.split(), title_font, 840)[:2]
+    start_x = 76
+    start_y = 336
+    line_height = round(title_font_size * 1.18)
     for index, line in enumerate(lines):
         line_text = " ".join(line)
-        width = draw.textlength(line_text, font=title_font)
         draw.text(
-            ((VIDEO_WIDTH - width) / 2, start_y + index * 108),
+            (start_x, start_y + index * line_height),
             line_text,
             font=title_font,
             fill="white",
-            stroke_width=5,
-            stroke_fill=(0, 0, 0, 230),
+            stroke_width=4,
+            stroke_fill=(0, 0, 0, 210),
         )
-    draw.rounded_rectangle((80, start_y - 28, 100, start_y + max(1, len(lines)) * 108 - 12), radius=10, fill=(46, 111, 255, 255))
+    bar_bottom = start_y + max(1, len(lines)) * line_height - 12
+    draw.rounded_rectangle((76, start_y - 12, 88, bar_bottom), radius=6, fill=(46, 111, 255, 255))
     image.alpha_composite(overlay)
 
 

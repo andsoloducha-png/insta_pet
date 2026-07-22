@@ -6,6 +6,8 @@ from google.genai import types
 
 from ai import (
     ReelContent,
+    _breed_is_relevant,
+    _clean_cover_title,
     _content_quality_issues,
     _normalise_content,
     _parse_response,
@@ -83,12 +85,20 @@ class ReelContentTests(unittest.TestCase):
         self.assertTrue(any("trzeciej osobie" in issue for issue in issues))
         self.assertTrue(any("toy" in issue for issue in issues))
 
+    def test_cover_title_removes_redundant_possessive_and_limits_words(self):
+        self.assertEqual(_clean_cover_title("Moja pierwsza wizyta u babci"), "PIERWSZA WIZYTA U BABCI")
+
+    def test_breed_is_only_relevant_for_breed_related_topics(self):
+        self.assertFalse(_breed_is_relevant("Wizyta u babci", "Jogi nasikał na dywan"))
+        self.assertTrue(_breed_is_relevant("Pierwsze strzyżenie", "Czesanie sierści pudla"))
+
     @patch("ai.time.sleep", return_value=None)
     @patch("ai.GEMINI_MAX_RETRIES", 3)
     @patch("ai.GEMINI_FALLBACK_MODELS", ())
     @patch("ai.GEMINI_MODEL", "gemini-3.5-flash")
     @patch("ai.GEMINI_API_KEY", "test-key")
     @patch("ai.GEMINI_EDITOR_ENABLED", False)
+    @patch("ai.GEMINI_PROOFREADER_ENABLED", False)
     def test_retries_truncated_json_on_same_model(self, _sleep):
         truncated = SimpleNamespace(
             parsed=None,
@@ -105,7 +115,7 @@ class ReelContentTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(result["naglowek"], "MÓJ LEŚNY PLAN")
         first_config = generate.call_args_list[0].kwargs["config"]
-        self.assertEqual(first_config.max_output_tokens, 4096)
+        self.assertEqual(first_config.max_output_tokens, 8192)
         self.assertEqual(first_config.thinking_config.thinking_level, types.ThinkingLevel.MINIMAL)
 
     @patch("ai.GEMINI_MAX_RETRIES", 1)
@@ -113,6 +123,7 @@ class ReelContentTests(unittest.TestCase):
     @patch("ai.GEMINI_MODEL", "gemini-3.5-flash")
     @patch("ai.GEMINI_API_KEY", "test-key")
     @patch("ai.GEMINI_EDITOR_ENABLED", True)
+    @patch("ai.GEMINI_PROOFREADER_ENABLED", False)
     def test_editor_unifies_perspective_and_removes_personal_hashtags(self):
         draft = ReelContent(
             voiceover="Jogi pierwszy raz odwiedza babcię. Trochę się zestresowałem.",
@@ -132,7 +143,7 @@ class ReelContentTests(unittest.TestCase):
             headline="Pierwsza wizyta",
             cover_title="U babci",
             caption_body=(
-                "Pierwszy raz odwiedziłem babcię jako ciekawski pudel miniaturowy. "
+                "Pierwszy raz odwiedziłem babcię i od razu zacząłem poznawać nowe miejsce. "
                 "Nowe miejsce trochę mnie zestresowało, ale spokojnie zacząłem poznawać "
                 "każdy kąt. Drugi pies zachował dystans, więc również obserwowałem "
                 "sytuację z daleka i niczego nie przyspieszałem. Taka wizyta była dla "
@@ -160,6 +171,67 @@ class ReelContentTests(unittest.TestCase):
         self.assertTrue(all("toy" not in tag.lower() for tag in result["hashtags"]))
         editor_config = generate.call_args_list[1].kwargs["config"]
         self.assertEqual(editor_config.thinking_config.thinking_level, types.ThinkingLevel.LOW)
+
+    @patch("ai.GEMINI_MAX_RETRIES", 1)
+    @patch("ai.GEMINI_FALLBACK_MODELS", ())
+    @patch("ai.GEMINI_MODEL", "gemini-3.5-flash")
+    @patch("ai.GEMINI_API_KEY", "test-key")
+    @patch("ai.GEMINI_EDITOR_ENABLED", False)
+    @patch("ai.GEMINI_PROOFREADER_ENABLED", True)
+    def test_proofreader_repairs_text_that_became_too_short(self):
+        valid_voiceover = (
+            "Pierwszy raz odwiedziłem babcię i spokojnie wszedłem do nowego domu. "
+            "Sisi nie zaakceptowała mojej obecności, a ja później nasikałem na dywan. "
+            "Tak wyglądał mój debiut."
+        )
+        valid_caption = (
+            "Pierwszy raz odwiedziłem babcię, ale domowa rezydentka Sisi nie "
+            "zaakceptowała mojej obecności. Później nasikałem na dywan i właśnie tak "
+            "zapisała się moja pierwsza wizyta w gościach. Bez dodatkowych sukcesów, "
+            "bez wielkiego finału — tylko ja, Sisi i ten nieszczęsny dywan. Czy Wasz "
+            "pies też kiedyś zaliczył podobną wpadkę poza domem?"
+        )
+        valid = ReelContent(
+            voiceover=valid_voiceover,
+            headline="Pierwsza wizyta",
+            cover_title="Wizyta u babci",
+            caption_body=valid_caption,
+            hashtags=["pies", "pieswgosciach", "psiezycie"],
+            alt_text="Pies w domu.",
+            asset_order=[],
+        )
+        shortened = ReelContent(
+            voiceover="Pierwszy raz odwiedziłem babcię.",
+            headline="Pierwsza wizyta",
+            cover_title="Wizyta u babci",
+            caption_body="Pierwszy raz odwiedziłem babcię. Czy Wasz pies też tak miał?",
+            hashtags=["pies", "pieswgosciach"],
+            alt_text="Pies w domu.",
+            asset_order=[],
+        )
+        generate = Mock(
+            side_effect=[
+                SimpleNamespace(parsed=valid, text=None, candidates=[]),
+                SimpleNamespace(parsed=shortened, text=None, candidates=[]),
+                SimpleNamespace(parsed=valid, text=None, candidates=[]),
+            ]
+        )
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+
+        with patch("ai.genai.Client", return_value=client):
+            result = generate_reel_content(
+                "Pierwsza wizyta u babci",
+                "Sisi nie toleruje Jogiego, a ten nasikał na dywan.",
+                [],
+            )
+
+        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(result["caption_body"], valid_caption)
+        proofreader_config = generate.call_args_list[2].kwargs["config"]
+        self.assertEqual(
+            proofreader_config.thinking_config.thinking_level,
+            types.ThinkingLevel.MEDIUM,
+        )
 
 
 if __name__ == "__main__":
