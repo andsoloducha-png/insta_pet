@@ -6,6 +6,7 @@ import math
 import mimetypes
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -18,6 +19,8 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 from config import (
     BASE_DIR,
+    TTS_FALLBACK_VOICES,
+    TTS_MAX_RETRIES,
     TTS_PITCH,
     TTS_RATE,
     TTS_VOICE,
@@ -61,6 +64,7 @@ class AudioResult:
     path: str
     words: tuple[TimedWord, ...]
     cues: tuple[CaptionCue, ...]
+    voice: str = ""
 
 
 @dataclass
@@ -441,8 +445,8 @@ def _approximate_words(text: str, duration: float) -> list[TimedWord]:
     return words
 
 
-async def _stream_edge_audio(text: str, output_path: Path) -> list[TimedWord]:
-    communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
+async def _stream_edge_audio(text: str, output_path: Path, voice: str) -> list[TimedWord]:
+    communicate = edge_tts.Communicate(text, voice, rate=TTS_RATE, pitch=TTS_PITCH)
     words: list[TimedWord] = []
     with output_path.open("wb") as audio_file:
         async for chunk in communicate.stream():
@@ -458,14 +462,39 @@ async def _stream_edge_audio(text: str, output_path: Path) -> list[TimedWord]:
 def generate_audio_with_timings(text: str, output_name: str = "temp_audio.mp3") -> AudioResult:
     ensure_output_dir()
     output_path = OUTPUT_DIR / output_name
-    words = asyncio.run(_stream_edge_audio(text, output_path))
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        raise RuntimeError("Edge TTS nie wygenerował pliku audio.")
+    voices = list(dict.fromkeys(voice for voice in (TTS_VOICE, *TTS_FALLBACK_VOICES) if voice))
+    errors: list[str] = []
+    selected_voice = ""
+    words: list[TimedWord] = []
+
+    for voice in voices:
+        for attempt in range(1, max(1, TTS_MAX_RETRIES) + 1):
+            output_path.unlink(missing_ok=True)
+            try:
+                words = asyncio.run(_stream_edge_audio(text, output_path, voice))
+                if not output_path.exists() or output_path.stat().st_size == 0:
+                    raise RuntimeError("usługa nie zwróciła danych audio")
+                selected_voice = voice
+                break
+            except Exception as exc:
+                output_path.unlink(missing_ok=True)
+                message = f"{voice}, próba {attempt}/{max(1, TTS_MAX_RETRIES)}: {exc}"
+                LOGGER.warning("Edge TTS nie wygenerował nagrania (%s)", message)
+                errors.append(message)
+                if attempt < max(1, TTS_MAX_RETRIES):
+                    time.sleep(attempt)
+        if selected_voice:
+            break
+
+    if not selected_voice:
+        raise RuntimeError(
+            "Edge TTS nie wygenerował nagrania żadnym polskim głosem. " + " | ".join(errors)
+        )
     if not words:
         with AudioFileClip(str(output_path)) as audio:
             words = _approximate_words(text, audio.duration)
     cues = build_caption_cues(words)
-    return AudioResult(str(output_path), tuple(words), tuple(cues))
+    return AudioResult(str(output_path), tuple(words), tuple(cues), selected_voice)
 
 
 def generate_audio(text: str, output_name: str = "temp_audio.mp3") -> str:
@@ -651,6 +680,7 @@ def save_manifest(data: dict, output_name: str) -> str:
 def audio_result_to_dict(result: AudioResult) -> dict:
     return {
         "path": result.path,
+        "voice": result.voice,
         "words": [asdict(word) for word in result.words],
         "cues": [
             {"start": cue.start, "end": cue.end, "text": cue.text}

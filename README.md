@@ -36,6 +36,10 @@ Domyślna konfiguracja Gemini ogranicza poziom rozumowania do `minimal`, przezna
 3 razy. Modelem awaryjnym jest `gemini-3.5-flash-lite`; wszystkie te wartości
 można zmienić w `.env` na podstawie `.env.example`.
 
+Domyślnym darmowym głosem jest aktualnie `pl-PL-ZofiaNeural`. Przy chwilowym
+braku audio skrypt ponawia syntezę, a następnie próbuje `pl-PL-MarekNeural`.
+Wybrany faktycznie głos zapisuje się w manifeście rolki.
+
 ## Konfiguracja arkusza
 
 Skrypt oczekuje kolumn `Nazwa`, `Opis`, `Link` i `instagram`. W kolumnie

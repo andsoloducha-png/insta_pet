@@ -2,6 +2,7 @@ import math
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -11,6 +12,7 @@ from media import (
     TimedWord,
     build_caption_cues,
     extract_drive_id,
+    generate_audio_with_timings,
     load_visual_asset,
     parse_media_links,
     render_frame,
@@ -103,6 +105,37 @@ class MediaTests(unittest.TestCase):
             image_path.unlink(missing_ok=True)
             audio_path.unlink(missing_ok=True)
             output_path.unlink(missing_ok=True)
+
+    @patch("media.time.sleep", return_value=None)
+    def test_tts_retries_and_uses_fallback_voice(self, _sleep):
+        output_name = "_test_tts_fallback.mp3"
+        output_path = OUTPUT_DIR / output_name
+        attempted_voices: list[str] = []
+
+        async def fake_stream(_text, path, voice):
+            attempted_voices.append(voice)
+            if voice == "pl-PL-UsunietyNeural":
+                raise RuntimeError("No audio was received")
+            path.write_bytes(b"fake-mp3-data")
+            return [TimedWord("Test", 0.0, 0.5)]
+
+        try:
+            with (
+                patch("media.TTS_VOICE", "pl-PL-UsunietyNeural"),
+                patch("media.TTS_FALLBACK_VOICES", ("pl-PL-ZofiaNeural",)),
+                patch("media.TTS_MAX_RETRIES", 2),
+                patch("media._stream_edge_audio", side_effect=fake_stream),
+            ):
+                result = generate_audio_with_timings("Test", output_name)
+        finally:
+            output_path.unlink(missing_ok=True)
+
+        self.assertEqual(
+            attempted_voices,
+            ["pl-PL-UsunietyNeural", "pl-PL-UsunietyNeural", "pl-PL-ZofiaNeural"],
+        )
+        self.assertEqual(result.voice, "pl-PL-ZofiaNeural")
+        self.assertEqual(result.words[0].text, "Test")
 
     @staticmethod
     def _write_tone(path: Path, duration: float, sample_rate: int = 48_000):

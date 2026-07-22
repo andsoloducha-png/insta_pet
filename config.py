@@ -44,7 +44,13 @@ SERVICE_ACCOUNT_FILE = str(_service_account_path.resolve())
 
 # Bezpłatna synteza mowy Microsoft Edge TTS.
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").strip().lower()
-TTS_VOICE = os.getenv("TTS_VOICE", "pl-PL-AgnieszkaNeural").strip()
+TTS_VOICE = os.getenv("TTS_VOICE", "pl-PL-ZofiaNeural").strip()
+TTS_FALLBACK_VOICES = tuple(
+    voice.strip()
+    for voice in os.getenv("TTS_FALLBACK_VOICES", "pl-PL-MarekNeural").split(",")
+    if voice.strip()
+)
+TTS_MAX_RETRIES = _env_int("TTS_MAX_RETRIES", 2)
 TTS_RATE = os.getenv("TTS_RATE", "+8%").strip()
 TTS_PITCH = os.getenv("TTS_PITCH", "+12Hz").strip()
 
