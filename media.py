@@ -604,19 +604,25 @@ def render_reel_video(
 def _draw_cover_text(image: Image.Image, text: str) -> None:
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    # Lekki cień tylko w górnej strefie poprawia czytelność bez zasłaniania psa.
-    gradient_top = 210
-    gradient_bottom = 690
+    # Dwustronnie wygaszony cień nie tworzy widocznej poziomej krawędzi.
+    gradient_top = 150
+    gradient_peak = 330
+    gradient_bottom = 700
     for y in range(gradient_top, gradient_bottom):
-        progress = (y - gradient_top) / (gradient_bottom - gradient_top)
-        alpha = round(105 * (1.0 - progress))
+        if y <= gradient_peak:
+            progress = (y - gradient_top) / (gradient_peak - gradient_top)
+        else:
+            progress = 1.0 - (y - gradient_peak) / (gradient_bottom - gradient_peak)
+        alpha = round(100 * max(0.0, min(1.0, progress)))
         draw.line((0, y, VIDEO_WIDTH, y), fill=(0, 0, 0, alpha))
 
     brand_font = _font(30)
     brand = f"{DOG_NAME.upper()} • DZIENNIK PSA"
     brand_y = 270
-    draw.rounded_rectangle((76, brand_y - 4, 88, brand_y + 39), radius=6, fill=(46, 111, 255, 255))
-    draw.text((108, brand_y), brand, font=brand_font, fill=(215, 227, 255, 255))
+    title_bar_left = 76
+    title_bar_right = 88
+    title_text_x = 112
+    draw.text((title_text_x, brand_y), brand, font=brand_font, fill=(215, 227, 255, 255))
 
     title_font_size = 78
     while title_font_size >= 56:
@@ -629,7 +635,7 @@ def _draw_cover_text(image: Image.Image, text: str) -> None:
         title_font_size = 56
         title_font = _font(title_font_size)
         lines = _wrap_words(draw, text.split(), title_font, 840)[:2]
-    start_x = 76
+    start_x = title_text_x
     start_y = 336
     line_height = round(title_font_size * 1.18)
     for index, line in enumerate(lines):
@@ -643,7 +649,11 @@ def _draw_cover_text(image: Image.Image, text: str) -> None:
             stroke_fill=(0, 0, 0, 210),
         )
     bar_bottom = start_y + max(1, len(lines)) * line_height - 12
-    draw.rounded_rectangle((76, start_y - 12, 88, bar_bottom), radius=6, fill=(46, 111, 255, 255))
+    draw.rounded_rectangle(
+        (title_bar_left, start_y - 12, title_bar_right, bar_bottom),
+        radius=6,
+        fill=(46, 111, 255, 255),
+    )
     image.alpha_composite(overlay)
 
 
