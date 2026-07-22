@@ -8,7 +8,14 @@ from google.genai import types
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import (
+    GEMINI_API_KEY,
+    GEMINI_FALLBACK_MODELS,
+    GEMINI_MAX_OUTPUT_TOKENS,
+    GEMINI_MAX_RETRIES,
+    GEMINI_MODEL,
+    GEMINI_THINKING_LEVEL,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -69,6 +76,52 @@ def _normalise_content(content: ReelContent, media_count: int) -> dict:
     }
 
 
+def _finish_reason(response: object) -> str:
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+        return getattr(reason, "value", None) or str(reason or "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _parse_response(response: object, media_count: int) -> dict:
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        content = parsed if isinstance(parsed, ReelContent) else ReelContent.model_validate(parsed)
+        return _normalise_content(content, media_count)
+
+    response_text = getattr(response, "text", None) or ""
+    if not response_text.strip():
+        raise ValueError(f"Gemini zwrócił pustą odpowiedź (finish_reason={_finish_reason(response)}).")
+    try:
+        content = ReelContent.model_validate_json(response_text)
+    except Exception as exc:
+        # Nie dołączamy treści odpowiedzi do wyjątku: może zawierać dane z dziennika.
+        raise ValueError(
+            "Gemini zwrócił niepełny lub niepoprawny JSON "
+            f"(finish_reason={_finish_reason(response)}, znaki={len(response_text)})."
+        ) from exc
+    return _normalise_content(content, media_count)
+
+
+def _thinking_level() -> types.ThinkingLevel:
+    level_name = GEMINI_THINKING_LEVEL.upper()
+    try:
+        return types.ThinkingLevel[level_name]
+    except KeyError:
+        LOGGER.warning("Nieznany GEMINI_THINKING_LEVEL=%s; używam minimal.", GEMINI_THINKING_LEVEL)
+        return types.ThinkingLevel.MINIMAL
+
+
+def _is_non_retryable_model_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in ("404", "not_found", "not available", "permission_denied", "invalid_argument")
+    )
+
+
 def generate_reel_content(
     nazwa: str,
     opis: str,
@@ -117,32 +170,36 @@ Przygotuj jedną spójną rolkę:
         except Exception as exc:
             LOGGER.warning("Nie udało się przygotować podglądu %s: %s", path, exc)
 
-    requested_models = [GEMINI_MODEL, "gemini-2.5-flash"]
+    requested_models = [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]
     models = list(dict.fromkeys(model for model in requested_models if model))
     errors: list[str] = []
     client = genai.Client(api_key=GEMINI_API_KEY)
 
     for model_name in models:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=inputs,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ReelContent,
-                    temperature=0.75,
-                    max_output_tokens=1400,
-                ),
-            )
-            parsed = response.parsed
-            if isinstance(parsed, ReelContent):
-                return _normalise_content(parsed, media_count)
-            if response.text:
-                return _normalise_content(ReelContent.model_validate_json(response.text), media_count)
-            raise ValueError("Gemini zwrócił pustą odpowiedź.")
-        except Exception as exc:
-            LOGGER.warning("Model %s nie wygenerował treści: %s", model_name, exc)
-            errors.append(f"{model_name}: {exc}")
-            time.sleep(1)
+        for attempt in range(1, max(1, GEMINI_MAX_RETRIES) + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=inputs,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ReelContent,
+                        temperature=0.65,
+                        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                        thinking_config=types.ThinkingConfig(
+                            thinking_level=_thinking_level(),
+                            include_thoughts=False,
+                        ),
+                    ),
+                )
+                return _parse_response(response, media_count)
+            except Exception as exc:
+                message = f"{model_name}, próba {attempt}/{max(1, GEMINI_MAX_RETRIES)}: {exc}"
+                LOGGER.warning("Model %s nie wygenerował treści: %s", model_name, message)
+                errors.append(message)
+                if _is_non_retryable_model_error(exc):
+                    break
+                if attempt < max(1, GEMINI_MAX_RETRIES):
+                    time.sleep(min(2 ** (attempt - 1), 4))
 
     raise RuntimeError("Nie udało się wygenerować treści przez Gemini. " + " | ".join(errors))

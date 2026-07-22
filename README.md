@@ -31,11 +31,19 @@ GEMINI_API_KEY=twoj_klucz
 Cudzysłowy są potrzebne tylko wtedy, gdy wartość zawiera spacje lub znak `#`.
 Plik `.env` oraz dane konta Google są wykluczone z Gita.
 
+Domyślna konfiguracja Gemini ogranicza poziom rozumowania do `minimal`, przeznacza
+4096 tokenów na kompletną odpowiedź JSON i ponawia chwilowo uciętą odpowiedź do
+3 razy. Modelem awaryjnym jest `gemini-3.5-flash-lite`; wszystkie te wartości
+można zmienić w `.env` na podstawie `.env.example`.
+
 ## Konfiguracja arkusza
 
 Skrypt oczekuje kolumn `Nazwa`, `Opis`, `Link` i `instagram`. W kolumnie
 `instagram` wartość `tak` oznacza wpis oczekujący. Po poprawnym wygenerowaniu
 zostanie ustawione `wygenerowane`, a przy błędzie `błąd`.
+
+Po usunięciu przyczyny błędu ustaw w danym wierszu ponownie `tak`, aby skrypt
+spróbował przetworzyć go jeszcze raz.
 
 W jednej komórce `Link` można umieścić kilka adresów, rozdzielając je nową linią,
 przecinkiem albo spacją, na przykład:
