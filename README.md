@@ -36,6 +36,16 @@ Domyślna konfiguracja Gemini ogranicza poziom rozumowania do `minimal`, przezna
 3 razy. Modelem awaryjnym jest `gemini-3.5-flash-lite`; wszystkie te wartości
 można zmienić w `.env` na podstawie `.env.example`.
 
+Profil bohatera jest stały (`DOG_NAME=Jogi`, `DOG_BREED=pudel miniaturowy`). Przy
+`GEMINI_EDITOR_ENABLED=true` drugie wywołanie Gemini redaguje szkic, sprawdza
+pierwszą osobę, fakty, rasę i długość. Zwiększa to zużycie Gemini, ale ogranicza
+niespójne lub dopowiedziane opisy. Automatyczna bramka jakości nie zapisze tekstu,
+który nadal miesza perspektywę albo zawiera określenie `toy`.
+
+Opis zawiera maksymalnie 5 niepersonalnych hashtagów: rasowy, szeroki `#pies` oraz
+tagi związane z konkretną historią. Tagi z imieniem psa i ogólne tagi spamowe
+(`fyp`, `viral`, `reels`) są automatycznie usuwane.
+
 Domyślnym darmowym głosem jest aktualnie `pl-PL-ZofiaNeural`. Przy chwilowym
 braku audio skrypt ponawia syntezę, a następnie próbuje `pl-PL-MarekNeural`.
 Wybrany faktycznie głos zapisuje się w manifeście rolki.

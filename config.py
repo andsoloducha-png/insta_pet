@@ -16,6 +16,15 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"Zmienna {name} musi być liczbą całkowitą, a jest: {value!r}") from exc
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    if value in {"1", "true", "tak", "yes", "on"}:
+        return True
+    if value in {"0", "false", "nie", "no", "off"}:
+        return False
+    raise ValueError(f"Zmienna {name} musi być wartością true/false, a jest: {value!r}")
+
+
 # Dostawca treści AI: "gemini" lub w przyszłości "openai".
 AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").strip().lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -28,8 +37,13 @@ GEMINI_FALLBACK_MODELS = tuple(
 GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 3)
 GEMINI_MAX_OUTPUT_TOKENS = _env_int("GEMINI_MAX_OUTPUT_TOKENS", 4096)
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "minimal").strip().lower()
+GEMINI_EDITOR_ENABLED = _env_bool("GEMINI_EDITOR_ENABLED", True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip()
+
+# Stały profil bohatera zapobiega zmianie rasy i perspektywy między wpisami.
+DOG_NAME = os.getenv("DOG_NAME", "Jogi").strip()
+DOG_BREED = os.getenv("DOG_BREED", "pudel miniaturowy").strip()
 
 # Google Sheets i plik konta usługi.
 SHEET_URL = os.getenv("SHEET_URL", "").strip()
