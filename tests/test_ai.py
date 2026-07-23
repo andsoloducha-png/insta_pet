@@ -51,6 +51,7 @@ class ReelContentTests(unittest.TestCase):
         self.assertIn("pudlem miniaturowym", result["lektor"].lower())
         self.assertIn("pudel miniaturowy", result["alt_text"].lower())
         self.assertEqual(result["naglowek"], "MÓJ LEŚNY PLAN")
+        self.assertEqual(result["format_id"], "punchline")
 
     def test_parse_error_does_not_expose_generated_content(self):
         response = SimpleNamespace(
@@ -96,6 +97,7 @@ class ReelContentTests(unittest.TestCase):
     @patch("ai.GEMINI_MAX_RETRIES", 3)
     @patch("ai.GEMINI_FALLBACK_MODELS", ())
     @patch("ai.GEMINI_MODEL", "gemini-3.5-flash")
+    @patch("ai.GEMINI_THINKING_LEVEL", "minimal")
     @patch("ai.GEMINI_API_KEY", "test-key")
     @patch("ai.GEMINI_EDITOR_ENABLED", False)
     @patch("ai.GEMINI_PROOFREADER_ENABLED", False)
@@ -117,6 +119,26 @@ class ReelContentTests(unittest.TestCase):
         first_config = generate.call_args_list[0].kwargs["config"]
         self.assertEqual(first_config.max_output_tokens, 8192)
         self.assertEqual(first_config.thinking_config.thinking_level, types.ThinkingLevel.MINIMAL)
+
+    @patch("ai.GEMINI_MAX_RETRIES", 3)
+    @patch("ai.GEMINI_FALLBACK_MODELS", ("gemini-3.5-flash-lite",))
+    @patch("ai.GEMINI_MODEL", "gemini-3.5-flash")
+    @patch("ai.GEMINI_API_KEY", "test-key")
+    @patch("ai.GEMINI_EDITOR_ENABLED", False)
+    @patch("ai.GEMINI_PROOFREADER_ENABLED", False)
+    def test_quota_error_switches_model_without_repeating_request(self):
+        complete = SimpleNamespace(parsed=self._content(), text=None, candidates=[])
+        generate = Mock(side_effect=[RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded"), complete])
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+
+        with patch("ai.genai.Client", return_value=client):
+            generate_reel_content("Spacer", "Jogi przy drzewie", [])
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["model"] for call in generate.call_args_list],
+            ["gemini-3.5-flash", "gemini-3.5-flash-lite"],
+        )
 
     @patch("ai.GEMINI_MAX_RETRIES", 1)
     @patch("ai.GEMINI_FALLBACK_MODELS", ())
@@ -178,7 +200,7 @@ class ReelContentTests(unittest.TestCase):
     @patch("ai.GEMINI_API_KEY", "test-key")
     @patch("ai.GEMINI_EDITOR_ENABLED", False)
     @patch("ai.GEMINI_PROOFREADER_ENABLED", True)
-    def test_proofreader_repairs_text_that_became_too_short(self):
+    def test_proofreader_keeps_better_text_without_extra_api_round(self):
         valid_voiceover = (
             "Pierwszy raz odwiedziłem babcię i spokojnie wszedłem do nowego domu. "
             "Sisi nie zaakceptowała mojej obecności, a ja później nasikałem na dywan. "
@@ -213,7 +235,6 @@ class ReelContentTests(unittest.TestCase):
             side_effect=[
                 SimpleNamespace(parsed=valid, text=None, candidates=[]),
                 SimpleNamespace(parsed=shortened, text=None, candidates=[]),
-                SimpleNamespace(parsed=valid, text=None, candidates=[]),
             ]
         )
         client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
@@ -225,9 +246,9 @@ class ReelContentTests(unittest.TestCase):
                 [],
             )
 
-        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(generate.call_count, 2)
         self.assertEqual(result["caption_body"], valid_caption)
-        proofreader_config = generate.call_args_list[2].kwargs["config"]
+        proofreader_config = generate.call_args_list[1].kwargs["config"]
         self.assertEqual(
             proofreader_config.thinking_config.thinking_level,
             types.ThinkingLevel.MEDIUM,

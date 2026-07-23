@@ -1,6 +1,7 @@
 google-genai>=2.13.0
 edge-tts>=7.2.8
 moviepy
+imageio-ffmpeg
 Pillow
 numpy
 pydantic
@@ -8,3 +9,5 @@ requests
 gspread
 oauth2client
 python-dotenv
+google-api-python-client
+google-auth-oauthlib

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from config import (
     DOG_BREED,
     DOG_NAME,
+    DOG_PERSONALITY,
     GEMINI_API_KEY,
     GEMINI_EDITOR_ENABLED,
     GEMINI_FALLBACK_MODELS,
@@ -22,6 +23,7 @@ from config import (
     GEMINI_PROOFREADER_ENABLED,
     GEMINI_THINKING_LEVEL,
 )
+from reel_formats import FORMAT_DESCRIPTIONS, ReelFormatId, normalise_reel_format
 
 
 LOGGER = logging.getLogger(__name__)
@@ -62,6 +64,10 @@ class ReelContent(BaseModel):
     hashtags: list[str] = Field(description="Od 3 do 5 niepersonalnych hashtagów tematycznych.")
     alt_text: str = Field(description="Krótki, rzeczowy tekst alternatywny mediów.")
     asset_order: list[int] = Field(description="Kolejność indeksów przesłanych mediów.")
+    format_id: ReelFormatId = Field(
+        default="punchline",
+        description="Format montażu: punchline, mini_story, comparison albo diary_mood.",
+    )
 
 
 def _media_preview(path: str | Path) -> types.Part:
@@ -144,6 +150,7 @@ def _normalise_content(content: ReelContent, media_count: int) -> dict:
         "caption": caption,
         "alt_text": alt_text,
         "asset_order": order,
+        "format_id": normalise_reel_format(content.format_id),
     }
 
 
@@ -246,7 +253,16 @@ def _is_non_retryable_model_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(
         marker in message
-        for marker in ("404", "not_found", "not available", "permission_denied", "invalid_argument")
+        for marker in (
+            "404",
+            "not_found",
+            "not available",
+            "permission_denied",
+            "invalid_argument",
+            "429",
+            "resource_exhausted",
+            "quota exceeded",
+        )
     )
 
 
@@ -314,11 +330,12 @@ def _editor_prompt(
     )
     return f"""
 Jesteś bezkompromisowym polskim redaktorem treści na Instagram. Popraw poniższy
-szkic, ale nie zmieniaj faktów, kolejności mediów ani sensu historii.
+szkic, ale nie zmieniaj faktów, kolejności mediów, format_id ani sensu historii.
 
 NIEPODWAŻALNY PROFIL BOHATERA:
 - imię: {DOG_NAME}
 - rasa: {DOG_BREED}; nigdy pudel toy ani toy poodle
+- osobowość: {DOG_PERSONALITY}
 - narrator voiceover i caption_body: wyłącznie pierwsza osoba liczby pojedynczej psa
 
 ŹRÓDŁO:
@@ -337,6 +354,10 @@ Lista kontrolna przed odpowiedzią:
    Błędnie: „Pudel {DOG_NAME} pierwszy raz odwiedza babcię...”.
 2. „{DOG_BREED}” to fakt profilu, nie slogan. Usuń każde „toy”. {breed_instruction}
 3. Zachowaj naturalną, potoczną polszczyznę, jedną mini-historię i maksymalnie 3 emoji.
+   Voiceover podziel na 2-4 krótkie, rytmiczne frazy z naturalnymi przecinkami.
+   Nie używaj wielokropków ani jednego długiego zdania wielokrotnie złożonego.
+   Wzmocnij zadziorność: pewność siebie, celna obserwacja i krótka puenta. Humor ma
+   wynikać z prawdziwego zdarzenia. Bez agresji, złośliwości i dopisywania faktów.
 4. Zweryfikuj szkic względem opisu i dołączonych mediów. Usuń każdy fakt, emocję,
    intencję i rezultat, którego nie potwierdza opis albo obraz. Nie zakładaj, że psy
    się polubiły, „przełamały lody”, zaakceptowały lub nauczyły czegoś, jeśli źródło
@@ -382,9 +403,9 @@ def _proofreader_prompt(
     return f"""
 Jesteś polskim korektorem końcowym. Popraw wyłącznie błędy językowe i niezręczne
 sformułowania w poniższym JSON-ie. Nie dodawaj faktów, emocji, skutków ani nowych
-żartów. Zachowaj pierwszą osobę psa, strukturę JSON, asset_order i sens wypowiedzi.
+żartów. Zachowaj pierwszą osobę psa, strukturę JSON, format_id, asset_order i sens wypowiedzi.
 
-Profil: {DOG_NAME}, {DOG_BREED}.
+Profil: {DOG_NAME}, {DOG_BREED}. Osobowość: {DOG_PERSONALITY}.
 Źródło: {nazwa or 'brak'} — {opis or 'brak'}.
 Zasada dowodowa: {evidence_rule}
 Zasada rasy: {breed_rule}
@@ -395,6 +416,8 @@ Sprawdź szczególnie:
 - naturalne związki frazeologiczne;
 - brak powtórzeń imienia i rasy (rasa najwyżej raz w voiceover + caption_body);
 - zachowanie długości: voiceover 24-45 słów, caption_body 250-600 znaków;
+- rytmiczny voiceover złożony z 2-4 krótkich fraz, bez wielokropków;
+- zachowanie pewnego siebie, lekko bezczelnego tonu i mocnej, krótkiej puenty;
 - literalne oparcie każdego twierdzenia na źródle lub obrazie. Usuń niewskazane
   działania i cechy, np. warczenie, szczekanie, reakcję „od progu”, „ulubiony” dywan,
   aferę, rewanż, stres albo zgodę, jeśli dokładnie tego nie potwierdza źródło;
@@ -429,13 +452,17 @@ def generate_reel_content(
             "w voiceover i caption_body. Rasa pojawi się w alt_text i hashtagu."
         )
     )
+    format_options = "\n".join(
+        f"- {format_id}: {description}"
+        for format_id, description in FORMAT_DESCRIPTIONS.items()
+    )
     prompt = f"""
 Jesteś polskim strategiem Instagram Reels i scenarzystą konta psa.
 
 NIEPODWAŻALNY PROFIL BOHATERA:
 - imię: {DOG_NAME}
 - rasa: {DOG_BREED}; nigdy pudel toy ani toy poodle
-- charakter: pogodny, inteligentny i lekko zadziorny
+- osobowość: {DOG_PERSONALITY}
 - narrator voiceover i caption_body: wyłącznie pierwsza osoba liczby pojedynczej psa
 
 Dane z dziennika:
@@ -449,19 +476,30 @@ Nie zakładaj, że spotkanie zakończyło się zgodą, akceptacją lub „przeł
 Jeśli czegoś nie wiadomo, użyj neutralnej obserwacji zamiast dopisywać fakt.
 
 Przygotuj jedną spójną rolkę:
-1. voiceover: 24-45 słów, około 7-14 sekund, od pierwszego do ostatniego zdania
+1. format_id: wybierz dokładnie jeden format najlepiej pasujący do historii i mediów:
+{format_options}
+   Nie wybieraj comparison ani mini_story dla jednego medium. Format określa montaż,
+   ale nie może skłaniać do wymyślania brakujących faktów.
+2. voiceover: 24-45 słów, około 7-14 sekund, od pierwszego do ostatniego zdania
    mówi {DOG_NAME} jako „ja”. Nie zaczynaj od „{DOG_NAME}...” ani „Pudel {DOG_NAME}...”.
-   Jedna mini-historia: hook, rozwinięcie, puenta. Bez żebrania o lajki.
-2. headline: 3-7 słów, konkretny hook bez clickbaitu.
-3. cover_title: maksymalnie 4 słowa, czytelny poza kontekstem rolki. Bez zbędnego
+   Jedna mini-historia: hook, rozwinięcie, puenta. Zapisz ją jako 2-4 krótkie,
+   rytmiczne frazy z naturalnymi przecinkami, bez wielokropków. Bez żebrania o lajki.
+   Hook ma od razu wyrażać pewność siebie lub przewrotną opinię. Ostatnia fraza ma
+   być krótką, celną puentą. Preferuj suchy humor, kontrast i psią logikę, np. typ
+   myślenia „człowiek widzi problem, ja widzę plan”. Nie kopiuj tego zdania.
+   Zadziorność nie oznacza agresji, obrażania ani wymyślania zachowań niewidocznych
+   w źródle. Unikaj mdłych podsumowań typu „to był miły dzień” i „było ciekawie”.
+3. headline: 3-7 słów, konkretny hook bez clickbaitu.
+4. cover_title: maksymalnie 4 słowa, czytelny poza kontekstem rolki. Bez zbędnego
    „mój/moja”, jeśli tytuł jest równie jasny bez tego słowa.
-4. caption_body: 250-600 znaków, również w pierwszej osobie psa. Użyj naturalnie
+5. caption_body: 250-600 znaków, również w pierwszej osobie psa. Użyj naturalnie
    słowa „pies” i tematu historii w pierwszych dwóch zdaniach. {breed_narration_instruction}
-   Maksymalnie 3 emoji. Na końcu jedno łatwe pytanie.
-5. hashtags: 3-5 niepersonalnych tagów. Bez imienia {DOG_NAME}. Miks: rasa, szersza
+   Zachowaj ten sam pewny siebie, dowcipny charakter co w voiceover. Maksymalnie
+   3 emoji. Na końcu jedno łatwe pytanie.
+6. hashtags: 3-5 niepersonalnych tagów. Bez imienia {DOG_NAME}. Miks: rasa, szersza
    kategoria psów i 1-3 tagi tematyczne. Bez #pudeltoy, #fyp, #viral i #reels.
-6. alt_text: rzeczowy opis wyłącznie tego, co faktycznie widać.
-7. asset_order: każdy poprawny indeks dokładnie raz; najmocniejszy kadr pierwszy.
+7. alt_text: rzeczowy opis wyłącznie tego, co faktycznie widać.
+8. asset_order: każdy poprawny indeks dokładnie raz; najmocniejszy kadr pierwszy.
 """
 
     media_parts: list[types.Part] = []
@@ -479,87 +517,74 @@ Przygotuj jedną spójną rolkę:
 
     final_content = draft
     if GEMINI_EDITOR_ENABLED:
-        editorial_draft = draft
         quality_feedback = _content_quality_issues(
-            editorial_draft,
+            final_content,
             allow_breed_in_narrative=allow_breed_in_narrative,
         )
-        for editorial_round in range(1, 3):
-            try:
-                final_content = _request_content(
-                    client,
-                    models,
-                    [
-                        _editor_prompt(
-                            editorial_draft,
-                            nazwa,
-                            opis,
-                            media_count,
-                            allow_breed_in_narrative,
-                            quality_feedback,
-                        ),
-                        *media_parts,
-                    ],
-                    temperature=0.15,
-                    stage=f"redakcja {editorial_round}/2",
-                    thinking_level=types.ThinkingLevel.LOW,
-                )
-            except Exception as exc:
-                LOGGER.warning("Redakcja Gemini %s/2 nie powiodła się: %s", editorial_round, exc)
-                continue
-
-            quality_feedback = _content_quality_issues(
-                final_content,
+        try:
+            candidate = _request_content(
+                client,
+                models,
+                [
+                    _editor_prompt(
+                        final_content,
+                        nazwa,
+                        opis,
+                        media_count,
+                        allow_breed_in_narrative,
+                        quality_feedback,
+                    ),
+                    *media_parts,
+                ],
+                temperature=0.15,
+                stage="redakcja",
+                thinking_level=types.ThinkingLevel.LOW,
+            )
+            candidate_issues = _content_quality_issues(
+                candidate,
                 allow_breed_in_narrative=allow_breed_in_narrative,
             )
-            if not quality_feedback:
-                break
-            LOGGER.warning(
-                "Kontrola jakości po redakcji %s/2: %s",
-                editorial_round,
-                "; ".join(quality_feedback),
-            )
-            editorial_draft = final_content
+            if len(candidate_issues) <= len(quality_feedback):
+                final_content = candidate
+            else:
+                LOGGER.warning("Redakcja pogorszyła kontrolę jakości; zachowuję wcześniejszy tekst.")
+        except Exception as exc:
+            LOGGER.warning("Redakcja Gemini nie powiodła się; zachowuję szkic: %s", exc)
 
     if GEMINI_PROOFREADER_ENABLED:
-        proofread_draft = final_content
-        proofread_feedback: list[str] = []
-        for proofread_round in range(1, 3):
-            try:
-                final_content = _request_content(
-                    client,
-                    models,
-                    [
-                        _proofreader_prompt(
-                            proofread_draft,
-                            nazwa,
-                            opis,
-                            media_count,
-                            allow_breed_in_narrative,
-                            proofread_feedback,
-                        ),
-                        *media_parts,
-                    ],
-                    temperature=0.1,
-                    stage=f"korekta językowa {proofread_round}/2",
-                    thinking_level=types.ThinkingLevel.MEDIUM,
-                )
-            except Exception as exc:
-                LOGGER.warning("Końcowa korekta językowa %s/2 nie powiodła się: %s", proofread_round, exc)
-                continue
-
-            proofread_feedback = _content_quality_issues(
-                final_content,
+        current_issues = _content_quality_issues(
+            final_content,
+            allow_breed_in_narrative=allow_breed_in_narrative,
+        )
+        try:
+            candidate = _request_content(
+                client,
+                models,
+                [
+                    _proofreader_prompt(
+                        final_content,
+                        nazwa,
+                        opis,
+                        media_count,
+                        allow_breed_in_narrative,
+                        current_issues,
+                    ),
+                    *media_parts,
+                ],
+                temperature=0.1,
+                stage="korekta językowa",
+                thinking_level=types.ThinkingLevel.MEDIUM,
+            )
+            candidate_issues = _content_quality_issues(
+                candidate,
                 allow_breed_in_narrative=allow_breed_in_narrative,
             )
-            if not proofread_feedback:
-                break
-            LOGGER.warning(
-                "Kontrola jakości po korekcie %s/2: %s",
-                proofread_round,
-                "; ".join(proofread_feedback),
-            )
-            proofread_draft = final_content
+            if len(candidate_issues) <= len(current_issues):
+                final_content = candidate
+            else:
+                LOGGER.warning("Korekta pogorszyła kontrolę jakości; zachowuję wcześniejszy tekst.")
+        except Exception as exc:
+            LOGGER.warning("Końcowa korekta językowa nie powiodła się; zachowuję tekst: %s", exc)
 
     if GEMINI_EDITOR_ENABLED or GEMINI_PROOFREADER_ENABLED:
         remaining_issues = _content_quality_issues(
@@ -567,8 +592,9 @@ Przygotuj jedną spójną rolkę:
             allow_breed_in_narrative=allow_breed_in_narrative,
         )
         if remaining_issues:
-            raise RuntimeError(
-                "Treść nie przeszła kontroli jakości: " + "; ".join(remaining_issues)
+            LOGGER.warning(
+                "Treść może wymagać ręcznej poprawy: %s",
+                "; ".join(remaining_issues),
             )
 
     return _normalise_content(final_content, media_count)

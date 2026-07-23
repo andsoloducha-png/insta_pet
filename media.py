@@ -6,6 +6,7 @@ import math
 import mimetypes
 import os
 import re
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -13,22 +14,37 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import edge_tts
+import imageio_ffmpeg
 import numpy as np
 import requests
+from google import genai
+from google.genai import types
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 from config import (
     BASE_DIR,
     DOG_NAME,
+    GEMINI_API_KEY,
+    GEMINI_TTS_FALLBACK_MODELS,
+    GEMINI_TTS_MAX_RETRIES,
+    GEMINI_TTS_MODEL,
+    GEMINI_TTS_VOICE,
     TTS_FALLBACK_VOICES,
+    TTS_EFFECTS_ENABLED,
     TTS_MAX_RETRIES,
     TTS_PITCH,
+    TTS_PRESET,
+    TTS_PROVIDER,
     TTS_RATE,
+    TTS_SIGNATURE_LAUGH_ENABLED,
+    TTS_SIGNATURE_LAUGH_FILE,
     TTS_VOICE,
     VIDEO_FPS,
     VIDEO_HEIGHT,
     VIDEO_WIDTH,
 )
+from tts_support import build_performance_prompt, extract_audio_bytes, save_pcm_wav
+from reel_formats import normalise_reel_format
 
 try:
     from moviepy import AudioFileClip, VideoClip
@@ -40,6 +56,15 @@ LOGGER = logging.getLogger(__name__)
 OUTPUT_DIR = BASE_DIR / "output"
 MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
 MAX_GIF_FRAMES = 450
+
+# Pełnoekranowy widok mobilny 9:16 pozostaje głównym kadrem rolki. Okładka ma
+# osobne położenie tekstu, które nadal mieści się w centralnym podglądzie 3:4.
+INSTAGRAM_HEADLINE_TOP = 205
+INSTAGRAM_COVER_BRAND_TOP = 270
+INSTAGRAM_COVER_TITLE_TOP = 336
+REEL_HEADLINE_MAX_WIDTH = 880
+REEL_CAPTION_MAX_WIDTH = 900
+COVER_TITLE_MAX_WIDTH = 840
 
 
 @dataclass(frozen=True)
@@ -66,6 +91,69 @@ class AudioResult:
     words: tuple[TimedWord, ...]
     cues: tuple[CaptionCue, ...]
     voice: str = ""
+    preset: str = ""
+    provider: str = ""
+    model: str = ""
+
+
+@dataclass(frozen=True)
+class VoicePreset:
+    """Autorski profil ekspresji, niezależny od nazw i materiałów CapCut."""
+
+    rate: str
+    pitch: str
+    audio_filter: str
+    voice: str = ""
+    max_pause: float = 0.0
+
+
+VOICE_PRESETS: dict[str, VoicePreset] = {
+    "jogi_playful_soft": VoicePreset(
+        rate="+2%",
+        pitch="+18Hz",
+        audio_filter=(
+            "highpass=f=90,lowpass=f=12000,"
+            "equalizer=f=2800:t=q:w=1.2:g=1.5,"
+            "acompressor=threshold=0.18:ratio=2.2:attack=8:release=90:makeup=1.25,"
+            "alimiter=limit=0.95"
+        ),
+    ),
+    "jogi_playful": VoicePreset(
+        rate="+10%",
+        pitch="+28Hz",
+        audio_filter=(
+            "highpass=f=105,lowpass=f=11500,"
+            "equalizer=f=180:t=q:w=1:g=-1.5,"
+            "equalizer=f=3200:t=q:w=1.1:g=2.8,"
+            "acompressor=threshold=0.16:ratio=2.8:attack=6:release=80:makeup=1.35,"
+            "alimiter=limit=0.94"
+        ),
+    ),
+    "jogi_playful_wild": VoicePreset(
+        rate="+14%",
+        pitch="+42Hz",
+        audio_filter=(
+            "highpass=f=120,lowpass=f=10500,"
+            "equalizer=f=200:t=q:w=1:g=-2.5,"
+            "equalizer=f=3600:t=q:w=1:g=4,"
+            "acompressor=threshold=0.14:ratio=3.2:attack=5:release=70:makeup=1.45,"
+            "alimiter=limit=0.93"
+        ),
+    ),
+    "jogi_urwis": VoicePreset(
+        rate="-4%",
+        pitch="+34Hz",
+        voice="pl-PL-MarekNeural",
+        max_pause=0.42,
+        audio_filter=(
+            "highpass=f=85,lowpass=f=11500,"
+            "equalizer=f=180:t=q:w=1:g=1.2,"
+            "equalizer=f=2900:t=q:w=1.15:g=2.2,"
+            "acompressor=threshold=0.17:ratio=2.5:attack=7:release=95:makeup=1.3,"
+            "alimiter=limit=0.95"
+        ),
+    ),
+}
 
 
 @dataclass
@@ -95,6 +183,16 @@ class VisualAsset:
 def ensure_output_dir() -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     return OUTPUT_DIR
+
+
+def resolve_output_path(output_name: str | Path) -> Path:
+    """Zwraca bezpieczną ścieżkę wewnątrz output i tworzy jej katalog nadrzędny."""
+    relative = Path(output_name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Nazwa pliku wyjściowego musi być ścieżką względną wewnątrz output.")
+    path = OUTPUT_DIR / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def parse_media_links(value: object) -> list[str]:
@@ -197,10 +295,10 @@ def download_media(link: str, output_stem: str) -> str:
 
     data = buffer.getvalue()
     extension = _extension_from_image(data, response.headers.get("Content-Type", ""))
-    output_path = OUTPUT_DIR / f"{output_stem}{extension}"
-    with output_path.open("wb") as file:
+    output_path_for_download = resolve_output_path(f"{output_stem}{extension}")
+    with output_path_for_download.open("wb") as file:
         file.write(data)
-    return str(output_path)
+    return str(output_path_for_download)
 
 
 def download_media_links(value: object, row_idx: int) -> list[str]:
@@ -210,7 +308,7 @@ def download_media_links(value: object, row_idx: int) -> list[str]:
     paths = []
     for index, link in enumerate(links, start=1):
         LOGGER.info("Pobieranie medium %s/%s", index, len(links))
-        paths.append(download_media(link, f"media_{row_idx}_{index}"))
+        paths.append(download_media(link, f"wiersz_{row_idx}/media_{index}"))
     return paths
 
 
@@ -310,6 +408,25 @@ def _wrap_words(draw: ImageDraw.ImageDraw, words: list[str], font, max_width: in
     return lines
 
 
+def _fit_wrapped_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_lines: int,
+    start_font_size: int,
+    min_font_size: int,
+) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[list[str]], int]:
+    """Zmniejsza tekst do zadanej liczby linii, ale nigdy nie usuwa słów."""
+    words = text.split()
+    for font_size in range(start_font_size, min_font_size - 1, -2):
+        font = _font(font_size)
+        lines = _wrap_words(draw, words, font, max_width)
+        if len(lines) <= max_lines:
+            return font, lines, font_size
+    font = _font(min_font_size)
+    return font, _wrap_words(draw, words, font, max_width), min_font_size
+
+
 def _cover_title_lines(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -327,12 +444,18 @@ def _cover_title_lines(
     return _wrap_words(draw, words, font, max_width)
 
 
-def _ken_burns(image: Image.Image, progress: float, segment_index: int, animated: bool) -> Image.Image:
+def _ken_burns(
+    image: Image.Image,
+    progress: float,
+    segment_index: int,
+    animated: bool,
+    strength_scale: float = 1.0,
+) -> Image.Image:
     progress = min(1.0, max(0.0, progress))
     smooth = progress * progress * (3 - 2 * progress)
     if segment_index % 2:
         smooth = 1.0 - smooth
-    strength = 0.026 if animated else 0.058
+    strength = (0.026 if animated else 0.058) * max(0.0, strength_scale)
     scale = 1.0 + strength * smooth
     width = max(VIDEO_WIDTH, round(VIDEO_WIDTH * scale))
     height = max(VIDEO_HEIGHT, round(VIDEO_HEIGHT * scale))
@@ -351,11 +474,17 @@ def _draw_headline(image: Image.Image, text: str) -> None:
         return
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    font = _font(76)
-    lines = _wrap_words(draw, text.split(), font, 880)[:2]
-    line_height = 88
+    font, lines, font_size = _fit_wrapped_text(
+        draw,
+        text,
+        max_width=REEL_HEADLINE_MAX_WIDTH,
+        max_lines=2,
+        start_font_size=76,
+        min_font_size=52,
+    )
+    line_height = round(font_size * 1.16)
     total_height = len(lines) * line_height
-    top = 205
+    top = INSTAGRAM_HEADLINE_TOP
     widths = [draw.textlength(" ".join(line), font=font) for line in lines]
     box_width = max(widths, default=0) + 80
     left = (VIDEO_WIDTH - box_width) / 2
@@ -384,7 +513,7 @@ def _draw_caption(image: Image.Image, cue: CaptionCue, current_time: float) -> N
     draw = ImageDraw.Draw(overlay)
     font = _font(58)
     words = [word.text for word in cue.words]
-    lines = _wrap_words(draw, words, font, 900)[:2]
+    lines = _wrap_words(draw, words, font, REEL_CAPTION_MAX_WIDTH)[:2]
     line_height = 72
     start_y = 1370 - (len(lines) - 1) * line_height // 2
     line_widths = [draw.textlength(" ".join(line), font=font) for line in lines]
@@ -448,6 +577,18 @@ def build_caption_cues(words: list[TimedWord], max_words: int = 5) -> list[Capti
     return cues
 
 
+def limit_caption_cues(
+    cues: list[CaptionCue],
+    maximum_end: float,
+) -> list[CaptionCue]:
+    """Kończy napisy przed podpisem dźwiękowym lub innym outro bez mowy."""
+    return [
+        CaptionCue(cue.start, min(cue.end, maximum_end), cue.words)
+        for cue in cues
+        if cue.start < maximum_end
+    ]
+
+
 def _approximate_words(text: str, duration: float) -> list[TimedWord]:
     tokens = re.findall(r"\S+", text)
     if not tokens:
@@ -463,8 +604,22 @@ def _approximate_words(text: str, duration: float) -> list[TimedWord]:
     return words
 
 
-async def _stream_edge_audio(text: str, output_path: Path, voice: str) -> list[TimedWord]:
-    communicate = edge_tts.Communicate(text, voice, rate=TTS_RATE, pitch=TTS_PITCH)
+def _voice_preset(name: str) -> VoicePreset:
+    try:
+        return VOICE_PRESETS[name]
+    except KeyError as exc:
+        available = ", ".join(VOICE_PRESETS)
+        raise ValueError(f"Nieznany preset głosu {name!r}. Dostępne: {available}") from exc
+
+
+async def _stream_edge_audio(
+    text: str,
+    output_path: Path,
+    voice: str,
+    rate: str,
+    pitch: str,
+) -> list[TimedWord]:
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     words: list[TimedWord] = []
     with output_path.open("wb") as audio_file:
         async for chunk in communicate.stream():
@@ -477,10 +632,180 @@ async def _stream_edge_audio(text: str, output_path: Path, voice: str) -> list[T
     return words
 
 
-def generate_audio_with_timings(text: str, output_name: str = "temp_audio.mp3") -> AudioResult:
+def _audio_duration(path: Path) -> float:
+    with AudioFileClip(str(path)) as audio:
+        return float(audio.duration)
+
+
+def _apply_voice_effect(source_path: Path, output_path: Path, audio_filter: str) -> float:
+    """Nakłada neutralną obróbkę i zwraca stosunek nowej długości do źródłowej."""
+    source_duration = _audio_duration(source_path)
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source_path),
+        "-vn",
+        "-af",
+        audio_filter,
+        "-codec:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        details = completed.stderr.strip() or "FFmpeg nie zwrócił szczegółów błędu"
+        raise RuntimeError(f"Nie udało się nałożyć efektu głosu: {details}")
+    output_duration = _audio_duration(output_path)
+    if source_duration <= 0 or output_duration <= 0:
+        raise RuntimeError("Obróbka głosu zwróciła nagranie o niepoprawnej długości.")
+    return output_duration / source_duration
+
+
+def _silence_cuts(
+    silences: list[tuple[float, float]],
+    max_pause: float,
+    duration: float,
+) -> list[tuple[float, float]]:
+    """Wyznacza części wewnętrznych pauz do usunięcia, bez cięcia początku i końca."""
+    if max_pause <= 0:
+        return []
+    cuts: list[tuple[float, float]] = []
+    half_pause = max_pause / 2
+    for silence_start, silence_end in silences:
+        if silence_start <= 0.05 or silence_end >= duration - 0.05:
+            continue
+        if silence_end - silence_start <= max_pause:
+            continue
+        cut_start = silence_start + half_pause
+        cut_end = silence_end - half_pause
+        if cut_end - cut_start >= 0.02:
+            cuts.append((cut_start, cut_end))
+    return cuts
+
+
+def _detect_silences(source_path: Path) -> list[tuple[float, float]]:
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        "-hide_banner",
+        "-i",
+        str(source_path),
+        "-af",
+        "silencedetect=noise=-36dB:d=0.08",
+        "-f",
+        "null",
+        "-",
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    starts = [
+        float(value)
+        for value in re.findall(r"silence_start:\s*([0-9.]+)", completed.stderr)
+    ]
+    ends = [
+        float(value)
+        for value in re.findall(r"silence_end:\s*([0-9.]+)", completed.stderr)
+    ]
+    return list(zip(starts, ends))
+
+
+def _retime_words_after_cuts(
+    words: list[TimedWord],
+    cuts: list[tuple[float, float]],
+) -> list[TimedWord]:
+    def removed_before(timestamp: float) -> float:
+        return sum(max(0.0, min(timestamp, end) - start) for start, end in cuts)
+
+    return [
+        TimedWord(
+            word.text,
+            word.start - removed_before(word.start),
+            word.end - removed_before(word.end),
+        )
+        for word in words
+    ]
+
+
+def _compact_long_pauses(
+    source_path: Path,
+    output_path: Path,
+    words: list[TimedWord],
+    max_pause: float,
+) -> list[TimedWord]:
+    duration = _audio_duration(source_path)
+    cuts = _silence_cuts(_detect_silences(source_path), max_pause, duration)
+    if not cuts:
+        return words
+
+    kept_intervals: list[tuple[float, float]] = []
+    cursor = 0.0
+    for cut_start, cut_end in cuts:
+        kept_intervals.append((cursor, cut_start))
+        cursor = cut_end
+    kept_intervals.append((cursor, duration))
+
+    filters = []
+    labels = []
+    for index, (start, end) in enumerate(kept_intervals):
+        label = f"part{index}"
+        filters.append(
+            f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[{label}]"
+        )
+        labels.append(f"[{label}]")
+    filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[out]")
+
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source_path),
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[out]",
+        "-codec:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        details = completed.stderr.strip() or "FFmpeg nie zwrócił szczegółów błędu"
+        raise RuntimeError(f"Nie udało się skrócić pauz lektora: {details}")
+    return _retime_words_after_cuts(words, cuts)
+
+
+def _scale_words(words: list[TimedWord], factor: float) -> list[TimedWord]:
+    if math.isclose(factor, 1.0, rel_tol=0.0, abs_tol=0.002):
+        return words
+    return [TimedWord(word.text, word.start * factor, word.end * factor) for word in words]
+
+
+def _generate_edge_audio_with_timings(
+    text: str,
+    output_name: str = "temp_audio.mp3",
+    preset_name: str | None = None,
+) -> AudioResult:
     ensure_output_dir()
-    output_path = OUTPUT_DIR / output_name
-    voices = list(dict.fromkeys(voice for voice in (TTS_VOICE, *TTS_FALLBACK_VOICES) if voice))
+    output_path = resolve_output_path(output_name)
+    selected_preset = (preset_name or TTS_PRESET).strip().lower()
+    preset = _voice_preset(selected_preset)
+    rate = TTS_RATE or preset.rate
+    pitch = TTS_PITCH or preset.pitch
+    source_path = output_path.with_name(f"{output_path.stem}.source{output_path.suffix}")
+    voices = list(
+        dict.fromkeys(
+            voice for voice in (preset.voice, TTS_VOICE, *TTS_FALLBACK_VOICES) if voice
+        )
+    )
     errors: list[str] = []
     selected_voice = ""
     words: list[TimedWord] = []
@@ -488,14 +813,40 @@ def generate_audio_with_timings(text: str, output_name: str = "temp_audio.mp3") 
     for voice in voices:
         for attempt in range(1, max(1, TTS_MAX_RETRIES) + 1):
             output_path.unlink(missing_ok=True)
+            source_path.unlink(missing_ok=True)
             try:
-                words = asyncio.run(_stream_edge_audio(text, output_path, voice))
-                if not output_path.exists() or output_path.stat().st_size == 0:
+                words = asyncio.run(_stream_edge_audio(text, source_path, voice, rate, pitch))
+                if not source_path.exists() or source_path.stat().st_size == 0:
                     raise RuntimeError("usługa nie zwróciła danych audio")
+                if preset.max_pause:
+                    paced_path = source_path.with_name(
+                        f"{source_path.stem}.paced{source_path.suffix}"
+                    )
+                    paced_path.unlink(missing_ok=True)
+                    paced_words = _compact_long_pauses(
+                        source_path,
+                        paced_path,
+                        words,
+                        preset.max_pause,
+                    )
+                    if paced_path.exists():
+                        source_path.unlink(missing_ok=True)
+                        paced_path.replace(source_path)
+                        words = paced_words
+                if TTS_EFFECTS_ENABLED:
+                    duration_factor = _apply_voice_effect(source_path, output_path, preset.audio_filter)
+                    words = _scale_words(words, duration_factor)
+                    source_path.unlink(missing_ok=True)
+                else:
+                    source_path.replace(output_path)
                 selected_voice = voice
                 break
             except Exception as exc:
                 output_path.unlink(missing_ok=True)
+                source_path.unlink(missing_ok=True)
+                source_path.with_name(f"{source_path.stem}.paced{source_path.suffix}").unlink(
+                    missing_ok=True
+                )
                 message = f"{voice}, próba {attempt}/{max(1, TTS_MAX_RETRIES)}: {exc}"
                 LOGGER.warning("Edge TTS nie wygenerował nagrania (%s)", message)
                 errors.append(message)
@@ -512,7 +863,156 @@ def generate_audio_with_timings(text: str, output_name: str = "temp_audio.mp3") 
         with AudioFileClip(str(output_path)) as audio:
             words = _approximate_words(text, audio.duration)
     cues = build_caption_cues(words)
-    return AudioResult(str(output_path), tuple(words), tuple(cues), selected_voice)
+    return AudioResult(
+        str(output_path),
+        tuple(words),
+        tuple(cues),
+        selected_voice,
+        selected_preset,
+        "edge",
+    )
+
+
+def _is_gemini_quota_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "429" in message or "resource_exhausted" in message or "quota exceeded" in message
+
+
+def _generate_gemini_pcm(text: str, output_path: Path) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Brak GEMINI_API_KEY potrzebnego do syntezy mowy Gemini.")
+    prompt = build_performance_prompt(text)
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    errors: list[str] = []
+    requested_models = [GEMINI_TTS_MODEL, *GEMINI_TTS_FALLBACK_MODELS]
+    models = list(dict.fromkeys(model for model in requested_models if model))
+    retries = max(1, GEMINI_TTS_MAX_RETRIES)
+    last_error: Exception | None = None
+    for model_name in models:
+        for attempt in range(1, retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=GEMINI_TTS_VOICE,
+                                )
+                            )
+                        ),
+                    ),
+                )
+                save_pcm_wav(output_path, extract_audio_bytes(response))
+                return model_name
+            except Exception as exc:
+                last_error = exc
+                output_path.unlink(missing_ok=True)
+                details = f"{model_name}, próba {attempt}/{retries}: {exc}"
+                errors.append(details)
+                LOGGER.warning("Gemini TTS nie wygenerował nagrania (%s)", details)
+                # Limit jest przypisany do modelu. Kolejne natychmiastowe próby tylko
+                # wydłużają pracę, więc przechodzimy od razu do modelu zapasowego.
+                if _is_gemini_quota_error(exc):
+                    break
+                if attempt < retries:
+                    time.sleep(attempt)
+    raise RuntimeError("Gemini TTS nie wygenerował nagrania: " + " | ".join(errors)) from last_error
+
+
+def _append_signature_laugh(
+    narration_path: Path,
+    laugh_path: Path,
+    output_path: Path,
+) -> None:
+    if not laugh_path.exists():
+        raise FileNotFoundError(f"Brak pliku podpisu dźwiękowego: {laugh_path}")
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(narration_path),
+        "-i",
+        str(laugh_path),
+        "-filter_complex",
+        (
+            "[0:a]aresample=24000,aformat=sample_fmts=s16:channel_layouts=mono[voice];"
+            "[1:a]aresample=24000,aformat=sample_fmts=s16:channel_layouts=mono[laugh];"
+            "[voice][laugh]concat=n=2:v=0:a=1[out]"
+        ),
+        "-map",
+        "[out]",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        details = completed.stderr.strip() or "FFmpeg nie zwrócił szczegółów błędu"
+        raise RuntimeError(f"Nie udało się dodać podpisu dźwiękowego: {details}")
+
+
+def _generate_gemini_audio_with_timings(
+    text: str,
+    output_name: str = "temp_audio.wav",
+) -> AudioResult:
+    ensure_output_dir()
+    requested_path = resolve_output_path(output_name)
+    output_path = requested_path.with_suffix(".wav")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    narration_path = output_path.with_name(f"{output_path.stem}.narration.wav")
+    output_path.unlink(missing_ok=True)
+    narration_path.unlink(missing_ok=True)
+
+    try:
+        selected_model = _generate_gemini_pcm(text, narration_path) or GEMINI_TTS_MODEL
+        narration_duration = _audio_duration(narration_path)
+        signature_used = TTS_SIGNATURE_LAUGH_ENABLED
+        if signature_used:
+            _append_signature_laugh(
+                narration_path,
+                Path(TTS_SIGNATURE_LAUGH_FILE),
+                output_path,
+            )
+            narration_path.unlink(missing_ok=True)
+        else:
+            narration_path.replace(output_path)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        narration_path.unlink(missing_ok=True)
+        raise
+
+    words = _approximate_words(text, narration_duration)
+    cues = limit_caption_cues(build_caption_cues(words), narration_duration)
+    preset = "achird_warm_signature" if signature_used else "achird"
+    return AudioResult(
+        str(output_path),
+        tuple(words),
+        tuple(cues),
+        GEMINI_TTS_VOICE,
+        preset,
+        "gemini",
+        selected_model,
+    )
+
+
+def generate_audio_with_timings(
+    text: str,
+    output_name: str = "temp_audio.mp3",
+    preset_name: str | None = None,
+    provider: str | None = None,
+) -> AudioResult:
+    selected_provider = (provider or TTS_PROVIDER).strip().lower()
+    if selected_provider == "gemini":
+        return _generate_gemini_audio_with_timings(text, output_name)
+    if selected_provider == "edge":
+        return _generate_edge_audio_with_timings(text, output_name, preset_name)
+    raise ValueError("TTS_PROVIDER musi mieć wartość 'gemini' albo 'edge'.")
 
 
 def generate_audio(text: str, output_name: str = "temp_audio.mp3") -> str:
@@ -531,6 +1031,119 @@ def _ordered_assets(assets: list[VisualAsset], asset_order: list[int] | None) ->
     return [assets[index] for index in valid]
 
 
+def _segment_position(
+    item_count: int,
+    duration: float,
+    current_time: float,
+) -> tuple[int, float, float]:
+    segment_duration = duration / max(1, item_count)
+    index = min(item_count - 1, int(current_time / max(segment_duration, 0.001)))
+    local_time = max(0.0, current_time - index * segment_duration)
+    progress = min(1.0, local_time / max(segment_duration, 0.001))
+    return index, local_time, progress
+
+
+def _asset_motion_frame(
+    asset: VisualAsset,
+    local_time: float,
+    progress: float,
+    index: int,
+    strength: float,
+) -> Image.Image:
+    return _ken_burns(
+        asset.frame_at(local_time),
+        progress,
+        index,
+        asset.animated,
+        strength_scale=strength,
+    ).convert("RGBA")
+
+
+def _punchline_frame(
+    assets: list[VisualAsset],
+    duration: float,
+    current_time: float,
+) -> Image.Image:
+    index, local_time, progress = _segment_position(len(assets), duration, current_time)
+    # Mocniejsze, bezpośrednie przybliżenie i twarde cięcia pod krótką puentę.
+    return _asset_motion_frame(assets[index], local_time, progress, index, strength=1.45)
+
+
+def _crossfaded_story_frame(
+    assets: list[VisualAsset],
+    duration: float,
+    current_time: float,
+    *,
+    strength: float,
+    transition_fraction: float,
+) -> Image.Image:
+    index, local_time, progress = _segment_position(len(assets), duration, current_time)
+    current = _asset_motion_frame(assets[index], local_time, progress, index, strength)
+    if index >= len(assets) - 1 or progress < 1.0 - transition_fraction:
+        return current
+
+    blend = (progress - (1.0 - transition_fraction)) / max(transition_fraction, 0.001)
+    next_frame = _asset_motion_frame(
+        assets[index + 1],
+        0.0,
+        blend,
+        index + 1,
+        strength,
+    )
+    return Image.blend(current, next_frame, min(1.0, max(0.0, blend)))
+
+
+def _comparison_frame(
+    assets: list[VisualAsset],
+    duration: float,
+    current_time: float,
+) -> Image.Image:
+    if len(assets) < 2:
+        return _punchline_frame(assets, duration, current_time)
+
+    pair_count = len(assets) - 1
+    pair_index, local_time, progress = _segment_position(pair_count, duration, current_time)
+    left_index = pair_index
+    right_index = pair_index + 1
+    left = _asset_motion_frame(
+        assets[left_index], local_time, progress, left_index, strength=0.7
+    )
+    right = _asset_motion_frame(
+        assets[right_index], local_time, 1.0 - progress, right_index, strength=0.7
+    )
+
+    half = VIDEO_WIDTH // 2
+    left_half = ImageOps.fit(left, (half, VIDEO_HEIGHT), method=Image.Resampling.LANCZOS)
+    right_half = ImageOps.fit(
+        right,
+        (VIDEO_WIDTH - half, VIDEO_HEIGHT),
+        method=Image.Resampling.LANCZOS,
+    )
+    canvas = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 255))
+    canvas.paste(left_half, (0, 0))
+    canvas.paste(right_half, (half, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((half - 4, 0, half + 4, VIDEO_HEIGHT), fill=(46, 111, 255, 255))
+    return canvas
+
+
+def _diary_mood_frame(
+    assets: list[VisualAsset],
+    duration: float,
+    current_time: float,
+) -> Image.Image:
+    image = _crossfaded_story_frame(
+        assets,
+        duration,
+        current_time,
+        strength=0.48,
+        transition_fraction=0.24,
+    )
+    # Delikatna, ciepła warstwa spaja spokojniejsze wpisy bez zasłaniania zdjęcia.
+    mood = Image.new("RGBA", image.size, (24, 12, 42, 20))
+    return Image.alpha_composite(image, mood)
+
+
 def render_frame(
     assets: list[VisualAsset],
     duration: float,
@@ -538,17 +1151,32 @@ def render_frame(
     headline: str = "",
     caption_cues: list[CaptionCue] | tuple[CaptionCue, ...] = (),
     asset_order: list[int] | None = None,
+    format_id: str = "punchline",
 ) -> np.ndarray:
     ordered = _ordered_assets(assets, asset_order)
-    segment_duration = duration / len(ordered)
-    segment_index = min(len(ordered) - 1, int(current_time / max(segment_duration, 0.001)))
-    segment_start = segment_index * segment_duration
-    local_time = max(0.0, current_time - segment_start)
-    progress = local_time / max(segment_duration, 0.001)
-    asset = ordered[segment_index]
-    image = _ken_burns(asset.frame_at(local_time), progress, segment_index, asset.animated).convert("RGBA")
+    selected_format = normalise_reel_format(format_id)
+    if selected_format == "mini_story":
+        image = _crossfaded_story_frame(
+            ordered,
+            duration,
+            current_time,
+            strength=0.9,
+            transition_fraction=0.14,
+        )
+    elif selected_format == "comparison":
+        image = _comparison_frame(ordered, duration, current_time)
+    elif selected_format == "diary_mood":
+        image = _diary_mood_frame(ordered, duration, current_time)
+    else:
+        image = _punchline_frame(ordered, duration, current_time)
 
-    headline_duration = min(1.8, max(1.1, duration * 0.2))
+    headline_share = {
+        "punchline": 0.16,
+        "mini_story": 0.20,
+        "comparison": 0.18,
+        "diary_mood": 0.24,
+    }[selected_format]
+    headline_duration = min(2.2, max(1.1, duration * headline_share))
     if current_time <= headline_duration:
         _draw_headline(image, headline)
     for cue in caption_cues:
@@ -565,12 +1193,13 @@ def render_reel_video(
     headline: str = "",
     caption_cues: list[CaptionCue] | tuple[CaptionCue, ...] = (),
     asset_order: list[int] | None = None,
+    format_id: str = "punchline",
     logger: str | None = "bar",
 ) -> str:
     ensure_output_dir()
     paths = [image_paths] if isinstance(image_paths, str) else image_paths
     assets = load_visual_assets(paths)
-    output_path = OUTPUT_DIR / output_name
+    output_path = resolve_output_path(output_name)
     audio = AudioFileClip(audio_path)
     duration = float(audio.duration)
     if duration <= 0:
@@ -578,7 +1207,15 @@ def render_reel_video(
         raise ValueError("Nagranie lektora ma niepoprawną długość.")
 
     def frame_function(t: float) -> np.ndarray:
-        return render_frame(assets, duration, float(t), headline, caption_cues, asset_order)
+        return render_frame(
+            assets,
+            duration,
+            float(t),
+            headline,
+            caption_cues,
+            asset_order,
+            format_id,
+        )
 
     video = VideoClip(frame_function=frame_function, duration=duration).with_audio(audio)
     try:
@@ -618,7 +1255,7 @@ def _draw_cover_text(image: Image.Image, text: str) -> None:
 
     brand_font = _font(30)
     brand = f"{DOG_NAME.upper()} • DZIENNIK PSA"
-    brand_y = 270
+    brand_y = INSTAGRAM_COVER_BRAND_TOP
     title_bar_left = 76
     title_bar_right = 88
     title_text_x = 112
@@ -627,16 +1264,16 @@ def _draw_cover_text(image: Image.Image, text: str) -> None:
     title_font_size = 78
     while title_font_size >= 56:
         title_font = _font(title_font_size)
-        lines = _cover_title_lines(draw, text, title_font, max_width=840)
+        lines = _cover_title_lines(draw, text, title_font, max_width=COVER_TITLE_MAX_WIDTH)
         if len(lines) <= 2:
             break
         title_font_size -= 2
     else:
         title_font_size = 56
         title_font = _font(title_font_size)
-        lines = _wrap_words(draw, text.split(), title_font, 840)[:2]
+        lines = _wrap_words(draw, text.split(), title_font, COVER_TITLE_MAX_WIDTH)[:2]
     start_x = title_text_x
-    start_y = 336
+    start_y = INSTAGRAM_COVER_TITLE_TOP
     line_height = round(title_font_size * 1.18)
     for index, line in enumerate(lines):
         line_text = " ".join(line)
@@ -669,7 +1306,7 @@ def create_cover(
     asset = _ordered_assets(assets, asset_order)[0]
     image = asset.frames[0].convert("RGBA")
     _draw_cover_text(image, title)
-    output_path = OUTPUT_DIR / output_name
+    output_path = resolve_output_path(output_name)
     image.convert("RGB").save(output_path, quality=93, optimize=True)
     return str(output_path)
 
@@ -680,7 +1317,7 @@ def prepare_916_image_with_text(image_path: str, text: str, output_name: str = "
     asset = load_visual_asset(image_path)
     image = asset.frames[0].convert("RGBA")
     _draw_headline(image, text)
-    output_path = OUTPUT_DIR / output_name
+    output_path = resolve_output_path(output_name)
     image.convert("RGB").save(output_path, quality=93, optimize=True)
     return str(output_path)
 
@@ -695,7 +1332,7 @@ def _srt_timestamp(seconds: float) -> str:
 
 def save_srt(cues: list[CaptionCue] | tuple[CaptionCue, ...], output_name: str) -> str:
     ensure_output_dir()
-    output_path = OUTPUT_DIR / output_name
+    output_path = resolve_output_path(output_name)
     blocks = []
     for index, cue in enumerate(cues, start=1):
         blocks.append(
@@ -707,14 +1344,14 @@ def save_srt(cues: list[CaptionCue] | tuple[CaptionCue, ...], output_name: str) 
 
 def save_instagram_caption(caption_text: str, output_name: str = "post_caption.txt") -> str:
     ensure_output_dir()
-    output_path = OUTPUT_DIR / output_name
+    output_path = resolve_output_path(output_name)
     output_path.write_text(caption_text.strip() + "\n", encoding="utf-8")
     return str(output_path)
 
 
 def save_manifest(data: dict, output_name: str) -> str:
     ensure_output_dir()
-    output_path = OUTPUT_DIR / output_name
+    output_path = resolve_output_path(output_name)
     output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(output_path)
 
@@ -723,6 +1360,9 @@ def audio_result_to_dict(result: AudioResult) -> dict:
     return {
         "path": result.path,
         "voice": result.voice,
+        "preset": result.preset,
+        "provider": result.provider,
+        "model": result.model,
         "words": [asdict(word) for word in result.words],
         "cues": [
             {"start": cue.start, "end": cue.end, "text": cue.text}
