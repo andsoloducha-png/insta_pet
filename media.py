@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import io
 import json
 import logging
@@ -11,7 +13,7 @@ import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import edge_tts
 import imageio_ffmpeg
@@ -24,6 +26,16 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from config import (
     BASE_DIR,
     DOG_NAME,
+    ELEVENLABS_API_KEY,
+    ELEVENLABS_MAX_RETRIES,
+    ELEVENLABS_MODEL,
+    ELEVENLABS_OUTPUT_FORMAT,
+    ELEVENLABS_SIMILARITY_BOOST,
+    ELEVENLABS_SPEAKER_BOOST,
+    ELEVENLABS_SPEED,
+    ELEVENLABS_STABILITY,
+    ELEVENLABS_STYLE,
+    ELEVENLABS_VOICE_ID,
     GEMINI_API_KEY,
     GEMINI_TTS_FALLBACK_MODELS,
     GEMINI_TTS_MAX_RETRIES,
@@ -957,6 +969,194 @@ def _append_signature_laugh(
         raise RuntimeError(f"Nie udało się dodać podpisu dźwiękowego: {details}")
 
 
+def _timed_words_from_alignment(alignment: dict | None) -> list[TimedWord]:
+    """Zamienia znaczniki czasu znaków ElevenLabs na znaczniki całych słów."""
+    if not alignment:
+        return []
+    characters = alignment.get("characters") or []
+    starts = alignment.get("character_start_times_seconds") or []
+    ends = alignment.get("character_end_times_seconds") or []
+    if not characters or not (len(characters) == len(starts) == len(ends)):
+        return []
+
+    words: list[TimedWord] = []
+    token_chars: list[str] = []
+    token_start: float | None = None
+    token_end: float | None = None
+
+    def flush_token() -> None:
+        nonlocal token_chars, token_start, token_end
+        if token_chars and token_start is not None and token_end is not None:
+            token = "".join(token_chars)
+            if words and not any(character.isalnum() for character in token):
+                previous = words[-1]
+                words[-1] = TimedWord(
+                    previous.text + token,
+                    previous.start,
+                    max(previous.end, token_end),
+                )
+            else:
+                words.append(TimedWord(token, token_start, token_end))
+        token_chars = []
+        token_start = None
+        token_end = None
+
+    try:
+        for character, start, end in zip(characters, starts, ends):
+            character = str(character)
+            start_value = max(0.0, float(start))
+            end_value = max(start_value, float(end))
+            if character.isspace():
+                flush_token()
+                continue
+            if token_start is None:
+                token_start = start_value
+            token_chars.append(character)
+            token_end = end_value
+    except (TypeError, ValueError):
+        return []
+    flush_token()
+    return words
+
+
+def _request_elevenlabs_audio(text: str, output_path: Path) -> list[TimedWord]:
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError(
+            "Brak ELEVENLABS_API_KEY. Uzupełnij go w .env albo ustaw TTS_PROVIDER=gemini."
+        )
+    if not ELEVENLABS_VOICE_ID:
+        raise RuntimeError(
+            "Brak ELEVENLABS_VOICE_ID. Wklej identyfikator klonu do .env "
+            "albo ustaw TTS_PROVIDER=gemini."
+        )
+    if not ELEVENLABS_OUTPUT_FORMAT.startswith("mp3_"):
+        raise ValueError(
+            "Generator obsługuje obecnie format ElevenLabs zaczynający się od 'mp3_'."
+        )
+
+    url = (
+        "https://api.elevenlabs.io/v1/text-to-speech/"
+        f"{quote(ELEVENLABS_VOICE_ID, safe='')}/with-timestamps"
+    )
+    response = requests.post(
+        url,
+        headers={
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        params={"output_format": ELEVENLABS_OUTPUT_FORMAT},
+        json={
+            "text": text,
+            "model_id": ELEVENLABS_MODEL,
+            "language_code": "pl",
+            "voice_settings": {
+                "stability": ELEVENLABS_STABILITY,
+                "similarity_boost": ELEVENLABS_SIMILARITY_BOOST,
+                "style": ELEVENLABS_STYLE,
+                "use_speaker_boost": ELEVENLABS_SPEAKER_BOOST,
+                "speed": ELEVENLABS_SPEED,
+            },
+        },
+        timeout=(10, 120),
+    )
+    if not response.ok:
+        try:
+            details = response.json().get("detail", "")
+            if isinstance(details, dict):
+                details = details.get("message") or details.get("status") or ""
+        except (ValueError, AttributeError):
+            details = ""
+        suffix = f": {str(details)[:240]}" if details else ""
+        raise RuntimeError(f"ElevenLabs HTTP {response.status_code}{suffix}")
+
+    try:
+        payload = response.json()
+        audio_bytes = base64.b64decode(payload["audio_base64"], validate=True)
+    except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+        raise RuntimeError("ElevenLabs zwrócił niepełną odpowiedź audio.") from exc
+    if not audio_bytes:
+        raise RuntimeError("ElevenLabs zwrócił pusty plik audio.")
+    output_path.write_bytes(audio_bytes)
+
+    alignment = payload.get("normalized_alignment") or payload.get("alignment")
+    return _timed_words_from_alignment(alignment)
+
+
+def _generate_elevenlabs_audio_with_timings(
+    text: str,
+    output_name: str = "temp_audio.mp3",
+) -> AudioResult:
+    ensure_output_dir()
+    requested_path = resolve_output_path(output_name)
+    signature_used = TTS_SIGNATURE_LAUGH_ENABLED
+    output_path = requested_path.with_suffix(".wav" if signature_used else ".mp3")
+    narration_path = (
+        output_path.with_name(f"{output_path.stem}.narration.mp3")
+        if signature_used
+        else output_path
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.unlink(missing_ok=True)
+    narration_path.unlink(missing_ok=True)
+
+    retries = max(1, ELEVENLABS_MAX_RETRIES)
+    errors: list[str] = []
+    words: list[TimedWord] = []
+    try:
+        for attempt in range(1, retries + 1):
+            narration_path.unlink(missing_ok=True)
+            try:
+                words = _request_elevenlabs_audio(text, narration_path)
+                break
+            except Exception as exc:
+                narration_path.unlink(missing_ok=True)
+                errors.append(f"próba {attempt}/{retries}: {exc}")
+                LOGGER.warning(
+                    "ElevenLabs nie wygenerował nagrania (próba %s/%s): %s",
+                    attempt,
+                    retries,
+                    exc,
+                )
+                message = str(exc)
+                if any(f"HTTP {status}" in message for status in (400, 401, 403, 404, 422)):
+                    break
+                if attempt < retries:
+                    time.sleep(attempt)
+        if not narration_path.exists() or narration_path.stat().st_size == 0:
+            raise RuntimeError(
+                "ElevenLabs nie wygenerował nagrania: " + " | ".join(errors)
+            )
+
+        narration_duration = _audio_duration(narration_path)
+        if not words:
+            words = _approximate_words(text, narration_duration)
+        if signature_used:
+            _append_signature_laugh(
+                narration_path,
+                Path(TTS_SIGNATURE_LAUGH_FILE),
+                output_path,
+            )
+            narration_path.unlink(missing_ok=True)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        if narration_path != output_path:
+            narration_path.unlink(missing_ok=True)
+        raise
+
+    cues = limit_caption_cues(build_caption_cues(words), narration_duration)
+    preset = "elevenlabs_clone_signature" if signature_used else "elevenlabs_clone"
+    return AudioResult(
+        str(output_path),
+        tuple(words),
+        tuple(cues),
+        ELEVENLABS_VOICE_ID,
+        preset,
+        "elevenlabs",
+        ELEVENLABS_MODEL,
+    )
+
+
 def _generate_gemini_audio_with_timings(
     text: str,
     output_name: str = "temp_audio.wav",
@@ -1010,9 +1210,13 @@ def generate_audio_with_timings(
     selected_provider = (provider or TTS_PROVIDER).strip().lower()
     if selected_provider == "gemini":
         return _generate_gemini_audio_with_timings(text, output_name)
+    if selected_provider == "elevenlabs":
+        return _generate_elevenlabs_audio_with_timings(text, output_name)
     if selected_provider == "edge":
         return _generate_edge_audio_with_timings(text, output_name, preset_name)
-    raise ValueError("TTS_PROVIDER musi mieć wartość 'gemini' albo 'edge'.")
+    raise ValueError(
+        "TTS_PROVIDER musi mieć wartość 'gemini', 'elevenlabs' albo 'edge'."
+    )
 
 
 def generate_audio(text: str, output_name: str = "temp_audio.mp3") -> str:

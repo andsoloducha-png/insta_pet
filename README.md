@@ -1,7 +1,7 @@
 # Generator rolek Jogiego
 
 Samodzielny generator pionowych rolek 9:16 na podstawie wpisu z dziennika psa.
-Gemini analizuje opis i media oraz tworzy polski głos Achird,
+Gemini analizuje opis i media, wybrany dostawca tworzy polskiego lektora,
 a lokalny renderer składa MP4, napisy, okładkę i opis Instagrama.
 
 ## Co obsługuje
@@ -32,6 +32,8 @@ GEMINI_API_KEY=twoj_klucz
 
 Cudzysłowy są potrzebne tylko wtedy, gdy wartość zawiera spacje lub znak `#`.
 Plik `.env` oraz dane konta Google są wykluczone z Gita.
+Kompletna checklista zmiany komputera i gotowy prompt dla nowej sesji Codexa
+znajdują się w `PRZENOSINY_NA_NOWY_PC.md`.
 
 Domyślna konfiguracja Gemini ogranicza poziom rozumowania do `minimal`, przeznacza
 8192 tokeny na kompletną odpowiedź JSON i ponawia chwilowo uciętą odpowiedź do
@@ -63,13 +65,47 @@ z przejściami, `comparison` zestawia materiały na podzielonym ekranie, a
 materiałów nie zostanie użyty dla pojedynczego zdjęcia. Lokalna historia manifestów
 zapobiega trzeciej rolce z rzędu w tym samym formacie.
 
-Domyślnym i jedynym automatycznie wybieranym głosem jest Gemini TTS `Achird`.
-Modele TTS mogą przełączać się przy wyczerpaniu limitu, ale nazwa głosu pozostaje
-zawsze taka sama. Po narracji skrypt
-dokleja autorski, stały podpis dźwiękowy `assets/jogi_signature_laugh.wav`, wycięty
-z zaakceptowanej próbki `warm`. Napisy kończą się przed śmiechem. Model, głos i użycie
-podpisu można zmienić przez `GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE` oraz
-`TTS_SIGNATURE_LAUGH_ENABLED`.
+Aktywny jest zawsze jeden dostawca głosu, wskazany przez `TTS_PROVIDER`. Do wyboru
+są Gemini TTS `Achird`, własny głos ElevenLabs oraz awaryjny Edge TTS. Modele
+zapasowe Gemini mogą zmieniać się po wyczerpaniu limitu, ale głos pozostaje ten sam.
+Po narracji skrypt może dokleić autorski podpis dźwiękowy
+`assets/jogi_signature_laugh.wav`, wycięty z zaakceptowanej próbki `warm`. Napisy
+kończą się przed śmiechem. Podpis działa ze wszystkimi dostawcami i kontroluje go
+niezależna flaga `TTS_SIGNATURE_LAUGH_ENABLED`.
+
+### Przełączanie głosu
+
+Dotychczasowy głos Gemini:
+
+```dotenv
+TTS_PROVIDER=gemini
+TTS_SIGNATURE_LAUGH_ENABLED=true
+```
+
+Własny głos partnerki z ElevenLabs:
+
+```dotenv
+TTS_PROVIDER=elevenlabs
+ELEVENLABS_API_KEY=twoj_klucz
+ELEVENLABS_VOICE_ID=id_utworzonego_glosu
+ELEVENLABS_MODEL=eleven_multilingual_v2
+TTS_SIGNATURE_LAUGH_ENABLED=true
+```
+
+Nie trzeba komentować ani usuwać ustawień drugiego głosu. Zmieniasz tylko jedną
+wartość `TTS_PROVIDER` i uruchamiasz skrypt ponownie. Flaga śmiechu jest osobna:
+`true` go dokleja, a `false` wyłącza. Ustawienia `ELEVENLABS_STABILITY`,
+`ELEVENLABS_SIMILARITY_BOOST`, `ELEVENLABS_STYLE` i `ELEVENLABS_SPEED` mają bezpieczne
+wartości początkowe w `.env.example`; najpierw warto sprawdzić je bez zmian.
+
+Po przełączeniu wykonaj krótką próbę bez pobierania wiersza z arkusza:
+
+```powershell
+.\.venv\Scripts\python.exe tts_preview.py
+```
+
+Próbka trafi do `output/voice_test/`. ElevenLabs zwraca dokładne znaczniki czasu
+znaków, z których generator buduje synchronizację napisów.
 
 Po wyczerpaniu limitu modelu 2.5 skrypt przechodzi bez zbędnych ponowień na
 `GEMINI_TTS_FALLBACK_MODELS` (domyślnie `gemini-3.1-flash-tts-preview`), nadal

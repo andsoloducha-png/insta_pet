@@ -16,6 +16,24 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"Zmienna {name} musi być liczbą całkowitą, a jest: {value!r}") from exc
 
 
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = os.getenv(name, str(default)).strip()
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise ValueError(f"Zmienna {name} musi być liczbą, a jest: {value!r}") from exc
+    if minimum is not None and number < minimum:
+        raise ValueError(f"Zmienna {name} nie może być mniejsza niż {minimum}.")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"Zmienna {name} nie może być większa niż {maximum}.")
+    return number
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name, str(default)).strip().lower()
     if value in {"1", "true", "tak", "yes", "on"}:
@@ -116,6 +134,29 @@ TTS_EFFECTS_ENABLED = _env_bool("TTS_EFFECTS_ENABLED", True)
 # pozwala świadomie nadpisać parametry, np. TTS_RATE=+5%.
 TTS_RATE = os.getenv("TTS_RATE", "").strip()
 TTS_PITCH = os.getenv("TTS_PITCH", "").strip()
+
+# ElevenLabs korzysta z własnego klonu głosu wskazanego przez VOICE_ID. Ustawienia
+# są wczytywane również przy TTS_PROVIDER=gemini, ale klucz jest wymagany dopiero
+# po świadomym przełączeniu dostawcy.
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2").strip()
+ELEVENLABS_OUTPUT_FORMAT = os.getenv(
+    "ELEVENLABS_OUTPUT_FORMAT",
+    "mp3_44100_128",
+).strip()
+ELEVENLABS_MAX_RETRIES = _env_int("ELEVENLABS_MAX_RETRIES", 3)
+ELEVENLABS_STABILITY = _env_float("ELEVENLABS_STABILITY", 0.45, 0.0, 1.0)
+ELEVENLABS_SIMILARITY_BOOST = _env_float(
+    "ELEVENLABS_SIMILARITY_BOOST",
+    0.80,
+    0.0,
+    1.0,
+)
+ELEVENLABS_STYLE = _env_float("ELEVENLABS_STYLE", 0.20, 0.0, 1.0)
+ELEVENLABS_SPEAKER_BOOST = _env_bool("ELEVENLABS_SPEAKER_BOOST", True)
+ELEVENLABS_SPEED = _env_float("ELEVENLABS_SPEED", 0.96, 0.7, 1.2)
+
 TTS_SIGNATURE_LAUGH_ENABLED = _env_bool("TTS_SIGNATURE_LAUGH_ENABLED", True)
 _signature_laugh_value = os.getenv(
     "TTS_SIGNATURE_LAUGH_FILE",

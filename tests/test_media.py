@@ -20,9 +20,11 @@ from media import (
     _fit_wrapped_text,
     _font,
     _generate_gemini_pcm,
+    _request_elevenlabs_audio,
     _retime_words_after_cuts,
     _silence_cuts,
     _scale_words,
+    _timed_words_from_alignment,
     _voice_preset,
     build_caption_cues,
     download_media_links,
@@ -278,6 +280,104 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(result.provider, "gemini")
         self.assertEqual(result.voice, "Achird")
         self.assertEqual(result.preset, "achird_warm_signature")
+        self.assertGreater(final_duration, 0.75)
+        self.assertLessEqual(result.cues[-1].end, 0.6)
+
+    def test_elevenlabs_alignment_is_grouped_into_caption_words(self):
+        text = "Cześć, tu Jogi!"
+        characters = list(text)
+        alignment = {
+            "characters": characters,
+            "character_start_times_seconds": [
+                index * 0.05 for index in range(len(characters))
+            ],
+            "character_end_times_seconds": [
+                (index + 1) * 0.05 for index in range(len(characters))
+            ],
+        }
+
+        words = _timed_words_from_alignment(alignment)
+
+        self.assertEqual([word.text for word in words], ["Cześć,", "tu", "Jogi!"])
+        self.assertAlmostEqual(words[0].start, 0.0)
+        self.assertAlmostEqual(words[-1].end, len(characters) * 0.05)
+
+    def test_elevenlabs_request_uses_clone_settings_and_exact_alignment(self):
+        output_path = OUTPUT_DIR / "_test_elevenlabs_response.mp3"
+        response = Mock(ok=True)
+        response.json.return_value = {
+            "audio_base64": "ZmFrZS1tcDM=",
+            "normalized_alignment": {
+                "characters": ["J", "o", "g", "i"],
+                "character_start_times_seconds": [0.0, 0.05, 0.10, 0.15],
+                "character_end_times_seconds": [0.05, 0.10, 0.15, 0.20],
+            },
+        }
+
+        try:
+            with (
+                patch("media.requests.post", return_value=response) as post,
+                patch("media.ELEVENLABS_API_KEY", "test-api-key"),
+                patch("media.ELEVENLABS_VOICE_ID", "test voice/id"),
+                patch("media.ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+                patch("media.ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
+                patch("media.ELEVENLABS_SPEED", 0.96),
+            ):
+                words = _request_elevenlabs_audio("Jogi", output_path)
+        finally:
+            output_path.unlink(missing_ok=True)
+
+        self.assertEqual([word.text for word in words], ["Jogi"])
+        self.assertEqual(post.call_args.kwargs["params"]["output_format"], "mp3_44100_128")
+        self.assertEqual(
+            post.call_args.kwargs["json"]["model_id"],
+            "eleven_multilingual_v2",
+        )
+        self.assertEqual(post.call_args.kwargs["json"]["language_code"], "pl")
+        self.assertEqual(post.call_args.kwargs["json"]["voice_settings"]["speed"], 0.96)
+        self.assertIn("test%20voice%2Fid", post.call_args.args[0])
+
+    def test_elevenlabs_provider_preserves_timings_and_appends_signature(self):
+        output_name = "_test_elevenlabs_audio.mp3"
+        output_path = OUTPUT_DIR / "_test_elevenlabs_audio.wav"
+        narration_path = OUTPUT_DIR / "_test_elevenlabs_audio.narration.mp3"
+        laugh_path = OUTPUT_DIR / "_test_elevenlabs_signature.wav"
+        expected_words = [
+            TimedWord("Cześć,", 0.05, 0.25),
+            TimedWord("Jogi!", 0.30, 0.58),
+        ]
+
+        def fake_elevenlabs(_text, path):
+            self._write_tone(path, duration=0.6)
+            return expected_words
+
+        try:
+            self._write_tone(laugh_path, duration=0.25)
+            with (
+                patch("media._request_elevenlabs_audio", side_effect=fake_elevenlabs),
+                patch("media.ELEVENLABS_MAX_RETRIES", 2),
+                patch("media.ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+                patch("media.ELEVENLABS_VOICE_ID", "test-voice-id"),
+                patch("media.TTS_SIGNATURE_LAUGH_ENABLED", True),
+                patch("media.TTS_SIGNATURE_LAUGH_FILE", str(laugh_path)),
+            ):
+                result = generate_audio_with_timings(
+                    "Cześć, Jogi!",
+                    output_name,
+                    provider="elevenlabs",
+                )
+            with AudioFileClip(result.path) as audio:
+                final_duration = audio.duration
+        finally:
+            output_path.unlink(missing_ok=True)
+            narration_path.unlink(missing_ok=True)
+            laugh_path.unlink(missing_ok=True)
+
+        self.assertEqual(result.provider, "elevenlabs")
+        self.assertEqual(result.model, "eleven_multilingual_v2")
+        self.assertEqual(result.voice, "test-voice-id")
+        self.assertEqual(result.preset, "elevenlabs_clone_signature")
+        self.assertEqual(list(result.words), expected_words)
         self.assertGreater(final_duration, 0.75)
         self.assertLessEqual(result.cues[-1].end, 0.6)
 
